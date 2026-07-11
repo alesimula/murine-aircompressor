@@ -23,3 +23,8 @@ jobs:
         run: mvn install -B -V -DskipTests -Dair.check.skip-all
       - name: Maven Tests
         run: mvn install -B -P ci
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: aircompressor-jdk${{ matrix.java-version }}
+          path: target/aircompressor-*.jar
