@@ -31,6 +31,19 @@ public class Lz4Compressor
         implements Compressor
 {
     private final int[] table = new int[MAX_TABLE_SIZE];
+    private final int acceleration;
+
+    public Lz4Compressor()
+    {
+        this(Lz4RawCompressor.DEFAULT_ACCELERATION);
+    }
+
+    // Murine: expose lz4.c's acceleration factor (1-65537, default 1); upstream v3 only
+    // exposes it on the native compressor
+    public Lz4Compressor(int acceleration)
+    {
+        this.acceleration = acceleration;
+    }
 
     @Override
     public int maxCompressedLength(int uncompressedSize)
@@ -47,7 +60,7 @@ public class Lz4Compressor
         long inputAddress = ARRAY_BYTE_BASE_OFFSET + inputOffset;
         long outputAddress = ARRAY_BYTE_BASE_OFFSET + outputOffset;
 
-        return Lz4RawCompressor.compress(input, inputAddress, inputLength, output, outputAddress, maxOutputLength, table);
+        return Lz4RawCompressor.compress(input, inputAddress, inputLength, output, outputAddress, maxOutputLength, table, acceleration);
     }
 
     @Override
@@ -109,7 +122,8 @@ public class Lz4Compressor
                         outputBase,
                         outputAddress,
                         outputLimit - outputAddress,
-                        table);
+                        table,
+                        acceleration);
                 output.position(output.position() + written);
             }
         }

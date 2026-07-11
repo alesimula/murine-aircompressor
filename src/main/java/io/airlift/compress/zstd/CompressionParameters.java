@@ -252,6 +252,19 @@ class CompressionParameters
         return strategy;
     }
 
+    // Murine: only DFAST has a Java implementation (levels 3-4 on the streaming table,
+    // level 3 universally); everything else lands on BlockCompressor.UNSUPPORTED and
+    // would throw UnsupportedOperationException mid-compression. Fail at construction.
+    static void checkLevelSupported(CompressionParameters parameters, int compressionLevel)
+    {
+        if (parameters.getStrategy().getCompressor() == BlockCompressor.UNSUPPORTED) {
+            throw new IllegalArgumentException("Compression level " + compressionLevel
+                    + " requires strategy " + parameters.getStrategy()
+                    + ", which is not implemented by the Java Zstd compressor"
+                    + " (supported: level 0 (default), 3, and 4 for streaming)");
+        }
+    }
+
     public static CompressionParameters compute(int compressionLevel, int estimatedInputSize)
     {
         CompressionParameters defaultParameters = getDefaultParameters(compressionLevel, estimatedInputSize);

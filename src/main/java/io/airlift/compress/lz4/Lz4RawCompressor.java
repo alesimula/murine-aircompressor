@@ -45,6 +45,10 @@ public final class Lz4RawCompressor
 
     private static final int SKIP_TRIGGER = 6;  /* Increase this value ==> compression run slower on incompressible data */
 
+    // Murine: acceleration as in lz4.c LZ4_compress_fast; each step trades ratio for speed
+    public static final int DEFAULT_ACCELERATION = 1;
+    public static final int MAX_ACCELERATION = 65537;
+
     private Lz4RawCompressor() {}
 
     private static int hash(long value, int mask)
@@ -75,6 +79,22 @@ public final class Lz4RawCompressor
             final long maxOutputLength,
             final int[] table)
     {
+        return compress(inputBase, inputAddress, inputLength, outputBase, outputAddress, maxOutputLength, table, DEFAULT_ACCELERATION);
+    }
+
+    public static int compress(
+            final Object inputBase,
+            final long inputAddress,
+            final int inputLength,
+            final Object outputBase,
+            final long outputAddress,
+            final long maxOutputLength,
+            final int[] table,
+            final int acceleration)
+    {
+        if (acceleration < DEFAULT_ACCELERATION || acceleration > MAX_ACCELERATION) {
+            throw new IllegalArgumentException("LZ4 acceleration must be in [" + DEFAULT_ACCELERATION + ", " + MAX_ACCELERATION + "] but got " + acceleration);
+        }
         int tableSize = computeTableSize(inputLength);
         Arrays.fill(table, 0, tableSize, 0);
 
@@ -112,7 +132,7 @@ public final class Lz4RawCompressor
         boolean done = false;
         do {
             long nextInputIndex = input;
-            int findMatchAttempts = 1 << SKIP_TRIGGER;
+            int findMatchAttempts = acceleration << SKIP_TRIGGER;
             int step = 1;
 
             // find 4-byte match

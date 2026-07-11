@@ -27,6 +27,25 @@ import static io.airlift.compress.UnsafeUtil.ARRAY_BYTE_BASE_OFFSET;
 public class ZstdCompressor
         implements Compressor
 {
+    private final int compressionLevel;
+
+    public ZstdCompressor()
+    {
+        this(CompressionParameters.DEFAULT_COMPRESSION_LEVEL);
+    }
+
+    // Murine: expose the compression level (0-22, default 3); see ZstdOutputStream
+    public ZstdCompressor(int compressionLevel)
+    {
+        // The parameter tables are selected per input size; probe every size class so an
+        // unsupported level fails here instead of on some future compress() call.
+        for (int estimatedSize : new int[] {-1, 256 * 1024, 128 * 1024, 16 * 1024}) {
+            CompressionParameters.checkLevelSupported(
+                    CompressionParameters.compute(compressionLevel, estimatedSize), compressionLevel);
+        }
+        this.compressionLevel = compressionLevel;
+    }
+
     @Override
     public int maxCompressedLength(int uncompressedSize)
     {
@@ -48,7 +67,7 @@ public class ZstdCompressor
         long inputAddress = ARRAY_BYTE_BASE_OFFSET + inputOffset;
         long outputAddress = ARRAY_BYTE_BASE_OFFSET + outputOffset;
 
-        return ZstdFrameCompressor.compress(input, inputAddress, inputAddress + inputLength, output, outputAddress, outputAddress + maxOutputLength, CompressionParameters.DEFAULT_COMPRESSION_LEVEL);
+        return ZstdFrameCompressor.compress(input, inputAddress, inputAddress + inputLength, output, outputAddress, outputAddress + maxOutputLength, compressionLevel);
     }
 
     @Override
@@ -110,7 +129,7 @@ public class ZstdCompressor
                         outputBase,
                         outputAddress,
                         outputLimit,
-                        CompressionParameters.DEFAULT_COMPRESSION_LEVEL);
+                        compressionLevel);
                 output.position(output.position() + written);
             }
         }

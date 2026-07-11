@@ -48,8 +48,18 @@ public class ZstdOutputStream
     public ZstdOutputStream(OutputStream outputStream)
             throws IOException
     {
+        this(outputStream, DEFAULT_COMPRESSION_LEVEL);
+    }
+
+    // Murine: expose the compression level (0-22, default 3). Upstream v3 only exposes
+    // this on the native compressor; the Java engine has always supported it internally.
+    public ZstdOutputStream(OutputStream outputStream, int compressionLevel)
+            throws IOException
+    {
         this.outputStream = requireNonNull(outputStream, "outputStream is null");
-        this.context = new CompressionContext(CompressionParameters.compute(DEFAULT_COMPRESSION_LEVEL, -1), ARRAY_BYTE_BASE_OFFSET, Integer.MAX_VALUE);
+        CompressionParameters parameters = CompressionParameters.compute(compressionLevel, -1);
+        CompressionParameters.checkLevelSupported(parameters, compressionLevel);
+        this.context = new CompressionContext(parameters, ARRAY_BYTE_BASE_OFFSET, Integer.MAX_VALUE);
         this.maxBufferSize = context.parameters.getWindowSize() * 4;
 
         // create output buffer large enough for a single block
