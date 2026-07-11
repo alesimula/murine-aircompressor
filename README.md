@@ -45,12 +45,14 @@ classes. The Zstandard streaming format is supported by `ZstdInputStream` and
 `ZstdOutputStream`.
 
 The compression level can be selected through the `ZstdCompressor(int)` and
-`ZstdOutputStream(OutputStream, int)` constructors. Note that the Java
-implementation only includes the `DFAST` strategy: the streaming compressor
-supports levels 0 (default), 3 and 4; higher strategies (`GREEDY` through
-`BTULTRA`) are not implemented and are rejected at construction. Decompression
-is strategy-agnostic and handles frames produced at any level by any zstd
-implementation.
+`ZstdOutputStream(OutputStream, int)` constructors. Following zstd's own
+convention, level 0 is an alias for the default level (3).
+
+Note that the Java implementation only includes the `DFAST`
+strategy: the streaming compressor supports levels 3 (default) and 4; higher
+strategies (`GREEDY` through `BTULTRA`) are not implemented and are rejected
+at construction. Decompression is strategy-agnostic and handles frames
+produced at any level by any zstd implementation.
 
 ## [LZ4](https://www.lz4.org/)
 LZ4 is an extremely fast compression algorithm that provides compression ratios comparable
@@ -84,6 +86,27 @@ Deflate data using Zstandard which provides superior compression and performance
 
 Deflate and gzip are available through the Hadoop stream implementations (see below),
 backed by the built-in Java libraries which internally use native code.
+
+# Hash Functions
+
+## [XXHash64](https://xxhash.com/)
+XXHash64 is an extremely fast non-cryptographic hash function with excellent distribution properties.
+
+The pure Java implementation is provided by `XxHash64JavaHasher`. The `XxHash64Hasher`
+interface provides static methods for one-shot hashing and a factory for streaming.
+
+```java
+// One-shot hashing
+long hash = XxHash64Hasher.hash(data);
+long hash = XxHash64Hasher.hash(data, seed);
+
+// Streaming hashing
+try (XxHash64Hasher hasher = XxHash64Hasher.create()) {
+    hasher.update(chunk1);
+    hasher.update(chunk2);
+    long hash = hasher.digest();
+}
+```
 
 # Hadoop Compression
 
