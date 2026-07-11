@@ -1,0 +1,4 @@
+jdk:
+  - openjdk8
+install:
+  - sh mvnw -B install -DskipTests -Dair.check.skip-all
