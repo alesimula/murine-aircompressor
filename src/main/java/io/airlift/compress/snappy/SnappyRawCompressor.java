@@ -20,7 +20,8 @@ import static io.airlift.compress.snappy.SnappyConstants.COPY_2_BYTE_OFFSET;
 import static io.airlift.compress.snappy.SnappyConstants.SIZE_OF_INT;
 import static io.airlift.compress.snappy.SnappyConstants.SIZE_OF_LONG;
 import static io.airlift.compress.snappy.SnappyConstants.SIZE_OF_SHORT;
-import static io.airlift.compress.snappy.UnsafeUtil.UNSAFE;
+import static io.airlift.compress.UnsafeUtil.copyMemory;
+import static io.airlift.compress.UnsafeUtil.UNSAFE;
 
 public final class SnappyRawCompressor
 {
@@ -223,7 +224,7 @@ public final class SnappyRawCompressor
             if (nextEmitAddress < blockLimit) {
                 int literalLength = (int) (blockLimit - nextEmitAddress);
                 output = emitLiteralLength(outputBase, output, literalLength);
-                UNSAFE.copyMemory(inputBase, nextEmitAddress, outputBase, output, literalLength);
+                copyMemory(inputBase, nextEmitAddress, outputBase, output, literalLength);
                 output += literalLength;
             }
         }

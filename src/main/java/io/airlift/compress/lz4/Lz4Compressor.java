@@ -19,10 +19,10 @@ import java.nio.Buffer;
 import java.nio.ByteBuffer;
 
 import static io.airlift.compress.lz4.Lz4RawCompressor.MAX_TABLE_SIZE;
-import static io.airlift.compress.lz4.UnsafeUtil.getAddress;
+import static io.airlift.compress.UnsafeUtil.getAddress;
 import static java.lang.String.format;
 import static java.util.Objects.requireNonNull;
-import static sun.misc.Unsafe.ARRAY_BYTE_BASE_OFFSET;
+import static io.airlift.compress.UnsafeUtil.ARRAY_BYTE_BASE_OFFSET;
 
 /**
  * This class is not thread-safe

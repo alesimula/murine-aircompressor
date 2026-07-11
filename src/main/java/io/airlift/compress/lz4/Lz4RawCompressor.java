@@ -19,7 +19,8 @@ import static io.airlift.compress.lz4.Lz4Constants.LAST_LITERAL_SIZE;
 import static io.airlift.compress.lz4.Lz4Constants.MIN_MATCH;
 import static io.airlift.compress.lz4.Lz4Constants.SIZE_OF_LONG;
 import static io.airlift.compress.lz4.Lz4Constants.SIZE_OF_SHORT;
-import static io.airlift.compress.lz4.UnsafeUtil.UNSAFE;
+import static io.airlift.compress.UnsafeUtil.copyMemory;
+import static io.airlift.compress.UnsafeUtil.UNSAFE;
 
 public final class Lz4RawCompressor
 {
@@ -273,7 +274,7 @@ public final class Lz4RawCompressor
             final long length)
     {
         long output = encodeRunLength(outputBase, outputAddress, length);
-        UNSAFE.copyMemory(inputBase, inputAddress, outputBase, output, length);
+        copyMemory(inputBase, inputAddress, outputBase, output, length);
 
         return output + length;
     }

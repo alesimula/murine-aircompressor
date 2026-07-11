@@ -19,10 +19,10 @@ import java.nio.Buffer;
 import java.nio.ByteBuffer;
 
 import static io.airlift.compress.zstd.Constants.MAX_BLOCK_SIZE;
-import static io.airlift.compress.zstd.UnsafeUtil.getAddress;
+import static io.airlift.compress.UnsafeUtil.getAddress;
 import static java.lang.String.format;
 import static java.util.Objects.requireNonNull;
-import static sun.misc.Unsafe.ARRAY_BYTE_BASE_OFFSET;
+import static io.airlift.compress.UnsafeUtil.ARRAY_BYTE_BASE_OFFSET;
 
 public class ZstdCompressor
         implements Compressor

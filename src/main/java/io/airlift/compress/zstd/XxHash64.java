@@ -17,11 +17,12 @@ import java.io.IOException;
 import java.io.InputStream;
 
 import static io.airlift.compress.zstd.Constants.SIZE_OF_LONG;
-import static io.airlift.compress.zstd.UnsafeUtil.UNSAFE;
+import static io.airlift.compress.UnsafeUtil.copyMemory;
+import static io.airlift.compress.UnsafeUtil.UNSAFE;
 import static io.airlift.compress.zstd.Util.checkPositionIndexes;
 import static java.lang.Long.rotateLeft;
 import static java.lang.Math.min;
-import static sun.misc.Unsafe.ARRAY_BYTE_BASE_OFFSET;
+import static io.airlift.compress.UnsafeUtil.ARRAY_BYTE_BASE_OFFSET;
 
 // forked from https://github.com/airlift/slice
 final class XxHash64
@@ -105,7 +106,7 @@ final class XxHash64
         if (bufferSize > 0) {
             int available = min(32 - bufferSize, length);
 
-            UNSAFE.copyMemory(base, address, buffer, BUFFER_ADDRESS + bufferSize, available);
+            copyMemory(base, address, buffer, BUFFER_ADDRESS + bufferSize, available);
 
             bufferSize += available;
             address += available;
@@ -124,7 +125,7 @@ final class XxHash64
         }
 
         if (length > 0) {
-            UNSAFE.copyMemory(base, address, buffer, BUFFER_ADDRESS, length);
+            copyMemory(base, address, buffer, BUFFER_ADDRESS, length);
             bufferSize = length;
         }
     }

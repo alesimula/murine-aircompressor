@@ -15,8 +15,8 @@ package io.airlift.compress.zstd;
 
 import java.util.Arrays;
 
-import static io.airlift.compress.zstd.UnsafeUtil.UNSAFE;
-import static sun.misc.Unsafe.ARRAY_BYTE_BASE_OFFSET;
+import static io.airlift.compress.UnsafeUtil.UNSAFE;
+import static io.airlift.compress.UnsafeUtil.ARRAY_BYTE_BASE_OFFSET;
 
 class Histogram
 {

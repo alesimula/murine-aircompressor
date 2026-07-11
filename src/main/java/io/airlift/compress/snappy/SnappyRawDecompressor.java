@@ -18,7 +18,8 @@ import io.airlift.compress.MalformedInputException;
 import static io.airlift.compress.snappy.SnappyConstants.LITERAL;
 import static io.airlift.compress.snappy.SnappyConstants.SIZE_OF_INT;
 import static io.airlift.compress.snappy.SnappyConstants.SIZE_OF_LONG;
-import static io.airlift.compress.snappy.UnsafeUtil.UNSAFE;
+import static io.airlift.compress.UnsafeUtil.copyMemory;
+import static io.airlift.compress.UnsafeUtil.UNSAFE;
 
 public final class SnappyRawDecompressor
 {
@@ -128,7 +129,7 @@ public final class SnappyRawDecompressor
                     }
 
                     // slow, precise copy
-                    UNSAFE.copyMemory(inputBase, input, outputBase, output, literalLength);
+                    copyMemory(inputBase, input, outputBase, output, literalLength);
                     input += literalLength;
                     output += literalLength;
                 }

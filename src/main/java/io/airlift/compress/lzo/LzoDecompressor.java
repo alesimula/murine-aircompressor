@@ -19,10 +19,10 @@ import io.airlift.compress.MalformedInputException;
 import java.nio.Buffer;
 import java.nio.ByteBuffer;
 
-import static io.airlift.compress.lzo.UnsafeUtil.getAddress;
+import static io.airlift.compress.UnsafeUtil.getAddress;
 import static java.lang.String.format;
 import static java.util.Objects.requireNonNull;
-import static sun.misc.Unsafe.ARRAY_BYTE_BASE_OFFSET;
+import static io.airlift.compress.UnsafeUtil.ARRAY_BYTE_BASE_OFFSET;
 
 public class LzoDecompressor
         implements Decompressor

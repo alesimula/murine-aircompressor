@@ -18,7 +18,8 @@ import java.util.Arrays;
 import static io.airlift.compress.lzo.LzoConstants.SIZE_OF_INT;
 import static io.airlift.compress.lzo.LzoConstants.SIZE_OF_LONG;
 import static io.airlift.compress.lzo.LzoConstants.SIZE_OF_SHORT;
-import static io.airlift.compress.lzo.UnsafeUtil.UNSAFE;
+import static io.airlift.compress.UnsafeUtil.copyMemory;
+import static io.airlift.compress.UnsafeUtil.UNSAFE;
 
 public final class LzoRawCompressor
 {
@@ -241,7 +242,7 @@ public final class LzoRawCompressor
             final long literalLength)
     {
         output = encodeLiteralLength(firstLiteral, outputBase, output, literalLength);
-        UNSAFE.copyMemory(inputBase, inputAddress, outputBase, output, literalLength);
+        copyMemory(inputBase, inputAddress, outputBase, output, literalLength);
         output += literalLength;
 
         // write stop command

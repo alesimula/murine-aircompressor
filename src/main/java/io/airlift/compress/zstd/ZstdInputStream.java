@@ -21,7 +21,7 @@ import static io.airlift.compress.zstd.Util.checkPositionIndexes;
 import static io.airlift.compress.zstd.Util.checkState;
 import static java.lang.Math.max;
 import static java.util.Objects.requireNonNull;
-import static sun.misc.Unsafe.ARRAY_BYTE_BASE_OFFSET;
+import static io.airlift.compress.UnsafeUtil.ARRAY_BYTE_BASE_OFFSET;
 
 public class ZstdInputStream
         extends InputStream

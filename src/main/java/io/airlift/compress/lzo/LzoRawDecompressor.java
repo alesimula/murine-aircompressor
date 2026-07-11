@@ -18,7 +18,8 @@ import io.airlift.compress.MalformedInputException;
 import static io.airlift.compress.lzo.LzoConstants.SIZE_OF_INT;
 import static io.airlift.compress.lzo.LzoConstants.SIZE_OF_LONG;
 import static io.airlift.compress.lzo.LzoConstants.SIZE_OF_SHORT;
-import static io.airlift.compress.lzo.UnsafeUtil.UNSAFE;
+import static io.airlift.compress.UnsafeUtil.copyMemory;
+import static io.airlift.compress.UnsafeUtil.UNSAFE;
 import static java.lang.Integer.toBinaryString;
 
 public final class LzoRawDecompressor
@@ -330,7 +331,7 @@ public final class LzoRawDecompressor
                     }
 
                     // slow, precise copy
-                    UNSAFE.copyMemory(inputBase, input, outputBase, output, literalLength);
+                    copyMemory(inputBase, input, outputBase, output, literalLength);
                     input += literalLength;
                     output += literalLength;
                 }
