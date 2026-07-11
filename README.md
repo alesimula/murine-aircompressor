@@ -1,5 +1,7 @@
 # Compression for Java
 
+[![](https://jitpack.io/v/alesimula/murine-aircompressor.svg)](https://jitpack.io/#alesimula/murine-aircompressor)
+
 This library provides a set of compression algorithms implemented in pure Java.
 The implementations use `sun.misc.Unsafe` to provide fast access to memory and
 are typically faster than the JNI wrappers for the native libraries.
@@ -9,6 +11,45 @@ This fork of [aircompressor](https://github.com/airlift/aircompressor) 2.x is
 members the library relied on are replaced with portable equivalents, and
 Android's own heap/native memcpy primitives are used when available (resolved
 once, with a pure-Java fallback).
+
+# Installation
+
+**Using Gradle**
+
+Add the JitPack repository to your root `build.gradle` (or `settings.gradle`):
+
+```gradle
+allprojects {
+    repositories {
+        maven { url 'https://jitpack.io' }
+    }
+}
+```
+
+Then add the dependency:
+
+```gradle
+    implementation 'com.github.alesimula:murine-aircompressor:2.0.4'
+```
+
+**Using Maven**
+
+```xml
+<repositories>
+    <repository>
+        <id>jitpack.io</id>
+        <url>https://jitpack.io</url>
+    </repository>
+</repositories>
+```
+
+```xml
+<dependency>
+    <groupId>com.github.alesimula</groupId>
+    <artifactId>murine-aircompressor</artifactId>
+    <version>2.0.4</version>
+</dependency>
+```
 
 # Usage
 
