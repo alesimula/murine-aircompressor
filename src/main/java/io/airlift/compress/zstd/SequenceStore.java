@@ -13,10 +13,10 @@
  */
 package io.airlift.compress.zstd;
 
-import static io.airlift.compress.zstd.Constants.SIZE_OF_LONG;
-import static io.airlift.compress.UnsafeUtil.copyMemory;
-import static io.airlift.compress.UnsafeUtil.UNSAFE;
 import static io.airlift.compress.UnsafeUtil.ARRAY_BYTE_BASE_OFFSET;
+import static io.airlift.compress.UnsafeUtil.UNSAFE;
+import static io.airlift.compress.UnsafeUtil.copyMemory;
+import static io.airlift.compress.zstd.Constants.SIZE_OF_LONG;
 
 class SequenceStore
 {

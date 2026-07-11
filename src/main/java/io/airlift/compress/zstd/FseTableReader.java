@@ -13,9 +13,9 @@
  */
 package io.airlift.compress.zstd;
 
+import static io.airlift.compress.UnsafeUtil.UNSAFE;
 import static io.airlift.compress.zstd.FiniteStateEntropy.MAX_SYMBOL;
 import static io.airlift.compress.zstd.FiniteStateEntropy.MIN_TABLE_LOG;
-import static io.airlift.compress.UnsafeUtil.UNSAFE;
 import static io.airlift.compress.zstd.Util.highestBit;
 import static io.airlift.compress.zstd.Util.verify;
 

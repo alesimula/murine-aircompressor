@@ -17,13 +17,14 @@ import io.airlift.compress.MalformedInputException;
 
 import java.util.Arrays;
 
+import static io.airlift.compress.UnsafeUtil.ARRAY_BYTE_BASE_OFFSET;
+import static io.airlift.compress.UnsafeUtil.UNSAFE;
 import static io.airlift.compress.zstd.Constants.COMPRESSED_BLOCK;
 import static io.airlift.compress.zstd.Constants.MAX_BLOCK_SIZE;
 import static io.airlift.compress.zstd.Constants.RAW_BLOCK;
 import static io.airlift.compress.zstd.Constants.RLE_BLOCK;
 import static io.airlift.compress.zstd.Constants.SIZE_OF_BLOCK_HEADER;
 import static io.airlift.compress.zstd.Constants.SIZE_OF_INT;
-import static io.airlift.compress.UnsafeUtil.UNSAFE;
 import static io.airlift.compress.zstd.Util.checkArgument;
 import static io.airlift.compress.zstd.Util.checkState;
 import static io.airlift.compress.zstd.Util.fail;
@@ -37,7 +38,6 @@ import static java.lang.Math.max;
 import static java.lang.Math.min;
 import static java.lang.Math.toIntExact;
 import static java.lang.String.format;
-import static io.airlift.compress.UnsafeUtil.ARRAY_BYTE_BASE_OFFSET;
 
 public class ZstdIncrementalFrameDecompressor
 {

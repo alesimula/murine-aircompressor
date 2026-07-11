@@ -15,13 +15,13 @@ package io.airlift.compress.snappy;
 
 import java.util.Arrays;
 
+import static io.airlift.compress.UnsafeUtil.UNSAFE;
+import static io.airlift.compress.UnsafeUtil.copyMemory;
 import static io.airlift.compress.snappy.SnappyConstants.COPY_1_BYTE_OFFSET;
 import static io.airlift.compress.snappy.SnappyConstants.COPY_2_BYTE_OFFSET;
 import static io.airlift.compress.snappy.SnappyConstants.SIZE_OF_INT;
 import static io.airlift.compress.snappy.SnappyConstants.SIZE_OF_LONG;
 import static io.airlift.compress.snappy.SnappyConstants.SIZE_OF_SHORT;
-import static io.airlift.compress.UnsafeUtil.copyMemory;
-import static io.airlift.compress.UnsafeUtil.UNSAFE;
 
 public final class SnappyRawCompressor
 {

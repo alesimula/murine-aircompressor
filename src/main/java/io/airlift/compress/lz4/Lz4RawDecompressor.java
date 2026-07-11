@@ -15,13 +15,13 @@ package io.airlift.compress.lz4;
 
 import io.airlift.compress.MalformedInputException;
 
+import static io.airlift.compress.UnsafeUtil.UNSAFE;
+import static io.airlift.compress.UnsafeUtil.copyMemory;
 import static io.airlift.compress.lz4.Lz4Constants.LAST_LITERAL_SIZE;
 import static io.airlift.compress.lz4.Lz4Constants.MIN_MATCH;
 import static io.airlift.compress.lz4.Lz4Constants.SIZE_OF_INT;
 import static io.airlift.compress.lz4.Lz4Constants.SIZE_OF_LONG;
 import static io.airlift.compress.lz4.Lz4Constants.SIZE_OF_SHORT;
-import static io.airlift.compress.UnsafeUtil.copyMemory;
-import static io.airlift.compress.UnsafeUtil.UNSAFE;
 
 public final class Lz4RawDecompressor
 {
