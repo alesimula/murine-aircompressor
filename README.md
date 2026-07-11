@@ -1,6 +1,6 @@
 # Compression for Java
 
-[![](https://jitpack.io/v/alesimula/murine-aircompressor.svg)](https://jitpack.io/#alesimula/murine-aircompressor)
+[![](https://jitpack.io/v/alesimula/murine-aircompressor.svg)](https://jitpack.io/#alesimula/murine-aircompressor) [![Build Status](https://img.shields.io/badge/build-passing-blue.svg)](https://jitpack.io/#alesimula/murine-aircompressor) [![License](https://img.shields.io/hexpm/l/plug.svg)](https://github.com/alesimula/murine-aircompressor/blob/main/license.txt)
 
 This library provides a set of compression algorithms implemented in pure Java.
 The implementations use `sun.misc.Unsafe` to provide fast access to memory and
