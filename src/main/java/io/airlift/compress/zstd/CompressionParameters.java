@@ -261,7 +261,7 @@ class CompressionParameters
             throw new IllegalArgumentException("Compression level " + compressionLevel
                     + " requires strategy " + parameters.getStrategy()
                     + ", which is not implemented by the Java Zstd compressor"
-                    + " (supported: level 0 (default), 3, and 4 for streaming)");
+                    + " (supported: 3 (the default; level 0 is zstd's alias for default) and 4 for streaming)");
         }
     }
 
