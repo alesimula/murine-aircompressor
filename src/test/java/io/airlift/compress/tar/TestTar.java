@@ -22,8 +22,10 @@ import java.io.IOException;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-public class TestTar {
-    private static byte[] pattern(int length) {
+public class TestTar
+{
+    private static byte[] pattern(int length)
+    {
         byte[] data = new byte[length];
         for (int i = 0; i < length; i++) {
             data[i] = (byte) (i % 251);
@@ -31,7 +33,9 @@ public class TestTar {
         return data;
     }
 
-    private static byte[] archive(Object[][] entries) throws IOException {
+    private static byte[] archive(Object[][] entries)
+            throws IOException
+    {
         ByteArrayOutputStream buffer = new ByteArrayOutputStream();
         try (TarOutputStream tar = new TarOutputStream(buffer)) {
             for (Object[] entry : entries) {
@@ -45,7 +49,9 @@ public class TestTar {
     }
 
     @Test
-    public void testRoundTripAtBlockBoundaries() throws IOException {
+    public void testRoundTripAtBlockBoundaries()
+            throws IOException
+    {
         Object[][] entries = {
                 {"empty", pattern(0)},
                 {"one", pattern(1)},
@@ -76,7 +82,9 @@ public class TestTar {
     }
 
     @Test
-    public void testEntriesCanBeSkipped() throws IOException {
+    public void testEntriesCanBeSkipped()
+            throws IOException
+    {
         byte[] archive = archive(new Object[][] {{"a", pattern(600)}, {"b", pattern(5)}});
         try (TarInputStream tar = new TarInputStream(new ByteArrayInputStream(archive))) {
             tar.getNextEntry(); // never read "a"
@@ -85,7 +93,9 @@ public class TestTar {
     }
 
     @Test
-    public void testLongNameViaPrefixSplit() throws IOException {
+    public void testLongNameViaPrefixSplit()
+            throws IOException
+    {
         String name = "some/deeply/nested/directory/structure/that/goes/on/for/quite/a/while/longer"
                 + "/than/one/hundred/characters/file.txt";
         assertThat(name.length()).isGreaterThan(100);
@@ -96,7 +106,9 @@ public class TestTar {
     }
 
     @Test
-    public void testUnsplittableLongNameViaPax() throws IOException {
+    public void testUnsplittableLongNameViaPax()
+            throws IOException
+    {
         String name = new String(new char[200]).replace('\0', 'x'); // no slashes: needs PAX
         byte[] archive = archive(new Object[][] {{name, pattern(7)}});
         try (TarInputStream tar = new TarInputStream(new ByteArrayInputStream(archive))) {
@@ -108,7 +120,9 @@ public class TestTar {
     }
 
     @Test
-    public void testPaxSizeRecordOverridesHeader() throws IOException {
+    public void testPaxSizeRecordOverridesHeader()
+            throws IOException
+    {
         // Craft what a PAX writer emits for an oversized entry: zeroed header size + size record
         ByteArrayOutputStream buffer = new ByteArrayOutputStream();
         try (TarOutputStream tar = new TarOutputStream(buffer)) {
@@ -122,7 +136,9 @@ public class TestTar {
     }
 
     @Test
-    public void testDirectoryEntry() throws IOException {
+    public void testDirectoryEntry()
+            throws IOException
+    {
         byte[] archive = archive(new Object[][] {{"some/dir/", pattern(0)}});
         try (TarInputStream tar = new TarInputStream(new ByteArrayInputStream(archive))) {
             assertThat(tar.getNextEntry().isDirectory()).isTrue();
@@ -130,13 +146,17 @@ public class TestTar {
     }
 
     @Test
-    public void testArchiveSizeIsExact() throws IOException {
+    public void testArchiveSizeIsExact()
+            throws IOException
+    {
         // header + 1 padded data block + two-block trailer
         assertThat(archive(new Object[][] {{"x", pattern(1)}}).length).isEqualTo(512 + 512 + 1024);
     }
 
     @Test
-    public void testWriteBeyondDeclaredSizeFails() throws IOException {
+    public void testWriteBeyondDeclaredSizeFails()
+            throws IOException
+    {
         TarOutputStream tar = new TarOutputStream(new ByteArrayOutputStream());
         tar.putNextEntry(new TarEntry("x", 2));
         assertThatThrownBy(() -> tar.write(pattern(3)))
@@ -145,7 +165,9 @@ public class TestTar {
     }
 
     @Test
-    public void testUnderfullEntryFailsOnClose() throws IOException {
+    public void testUnderfullEntryFailsOnClose()
+            throws IOException
+    {
         TarOutputStream tar = new TarOutputStream(new ByteArrayOutputStream());
         tar.putNextEntry(new TarEntry("x", 5));
         tar.write(pattern(2));
@@ -155,7 +177,9 @@ public class TestTar {
     }
 
     @Test
-    public void testCorruptChecksumIsRejected() throws IOException {
+    public void testCorruptChecksumIsRejected()
+            throws IOException
+    {
         byte[] archive = archive(new Object[][] {{"x", pattern(5)}});
         archive[0] ^= 1; // flip a bit in the name field
         try (TarInputStream tar = new TarInputStream(new ByteArrayInputStream(archive))) {
@@ -166,7 +190,9 @@ public class TestTar {
     }
 
     @Test
-    public void testTruncatedArchiveIsDetected() throws IOException {
+    public void testTruncatedArchiveIsDetected()
+            throws IOException
+    {
         byte[] archive = archive(new Object[][] {{"x", pattern(600)}});
         byte[] truncated = new byte[700]; // mid-data
         System.arraycopy(archive, 0, truncated, 0, 700);

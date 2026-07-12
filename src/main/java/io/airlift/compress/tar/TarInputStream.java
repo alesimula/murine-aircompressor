@@ -27,13 +27,16 @@ import static java.nio.charset.StandardCharsets.UTF_8;
  * PAX extended headers (path, size, mtime) and GNU long names are applied to
  * the entry they precede; other extension records are consumed and ignored.
  */
-public class TarInputStream extends FilterInputStream {
+public class TarInputStream
+        extends FilterInputStream
+{
     private final byte[] block = new byte[512];
     private long remaining;
     private int padding;
     private boolean eof;
 
-    public TarInputStream(InputStream in) {
+    public TarInputStream(InputStream in)
+    {
         super(in);
     }
 
@@ -41,14 +44,18 @@ public class TarInputStream extends FilterInputStream {
      * Skips whatever is left of the current entry and returns the next one,
      * or null at the end of the archive.
      */
-    public TarEntry getNextEntry() throws IOException {
+    public TarEntry getNextEntry()
+            throws IOException
+    {
         if (eof) {
             return null;
         }
         long toSkip = remaining + padding;
         while (toSkip > 0) {
             int read = in.read(block, 0, (int) Math.min(toSkip, 512));
-            if (read < 0) throw new EOFException("Truncated tar archive");
+            if (read < 0) {
+                throw new EOFException("Truncated tar archive");
+            }
             toSkip -= read;
         }
         remaining = 0;
@@ -75,31 +82,51 @@ public class TarInputStream extends FilterInputStream {
                     int at = 0;
                     while (at < data.length) {
                         int space = at;
-                        while (data[space] != ' ') space++;
+                        while (data[space] != ' ') {
+                            space++;
+                        }
                         int end = at + Integer.parseInt(new String(data, at, space - at, UTF_8));
                         String record = new String(data, space + 1, end - space - 2, UTF_8); // minus '\n'
                         int eq = record.indexOf('=');
                         String key = record.substring(0, eq);
                         String value = record.substring(eq + 1);
-                        if (key.equals("path")) paxPath = value;
-                        else if (key.equals("size")) paxSize = value;
-                        else if (key.equals("mtime")) paxMtime = value;
+                        if (key.equals("path")) {
+                            paxPath = value;
+                        }
+                        else if (key.equals("size")) {
+                            paxSize = value;
+                        }
+                        else if (key.equals("mtime")) {
+                            paxMtime = value;
+                        }
                         at = end;
                     }
                 }
                 else if (type == 'L') {
                     int end = 0;
-                    while (end < data.length && data[end] != 0) end++;
+                    while (end < data.length && data[end] != 0) {
+                        end++;
+                    }
                     gnuName = new String(data, 0, end, UTF_8);
                 }
                 // 'g' (global) and 'K' (long link) records are ignored
-                if (!readBlock()) throw new EOFException("Truncated tar archive");
+                if (!readBlock()) {
+                    throw new EOFException("Truncated tar archive");
+                }
                 continue;
             }
-            if (gnuName != null) entry.setName(gnuName);
-            if (paxPath != null) entry.setName(paxPath);
-            if (paxSize != null) entry.setSize(Long.parseLong(paxSize));
-            if (paxMtime != null) entry.setModTime((long) (Double.parseDouble(paxMtime) * 1000));
+            if (gnuName != null) {
+                entry.setName(gnuName);
+            }
+            if (paxPath != null) {
+                entry.setName(paxPath);
+            }
+            if (paxSize != null) {
+                entry.setSize(Long.parseLong(paxSize));
+            }
+            if (paxMtime != null) {
+                entry.setModTime((long) (Double.parseDouble(paxMtime) * 1000));
+            }
             remaining = entry.getSize();
             padding = (int) (-remaining & 511);
             return entry;
@@ -107,46 +134,66 @@ public class TarInputStream extends FilterInputStream {
     }
 
     /** Reads an extension entry's data in full, including its padding. */
-    private byte[] readEntryData(TarEntry entry) throws IOException {
-        if (entry.getSize() > 1 << 20) throw new IOException("Oversized tar extension record");
+    private byte[] readEntryData(TarEntry entry)
+            throws IOException
+    {
+        if (entry.getSize() > 1 << 20) {
+            throw new IOException("Oversized tar extension record");
+        }
         int size = (int) entry.getSize();
         byte[] data = new byte[size];
         int total = 0;
         while (total < size) {
             int read = in.read(data, total, size - total);
-            if (read < 0) throw new EOFException("Truncated tar archive");
+            if (read < 0) {
+                throw new EOFException("Truncated tar archive");
+            }
             total += read;
         }
         long pad = -entry.getSize() & 511;
         while (pad > 0) {
             int read = in.read(block, 0, (int) pad);
-            if (read < 0) throw new EOFException("Truncated tar archive");
+            if (read < 0) {
+                throw new EOFException("Truncated tar archive");
+            }
             pad -= read;
         }
         return data;
     }
 
     @Override
-    public int read() throws IOException {
+    public int read()
+            throws IOException
+    {
         byte[] one = new byte[1];
         return read(one, 0, 1) < 0 ? -1 : one[0] & 0xFF;
     }
 
     @Override
-    public int read(byte[] buffer, int offset, int length) throws IOException {
-        if (remaining == 0) return -1;
+    public int read(byte[] buffer, int offset, int length)
+            throws IOException
+    {
+        if (remaining == 0) {
+            return -1;
+        }
         int read = in.read(buffer, offset, (int) Math.min(length, remaining));
-        if (read < 0) throw new EOFException("Truncated tar archive");
+        if (read < 0) {
+            throw new EOFException("Truncated tar archive");
+        }
         remaining -= read;
         return read;
     }
 
-    private boolean readBlock() throws IOException {
+    private boolean readBlock()
+            throws IOException
+    {
         int total = 0;
         while (total < 512) {
             int read = in.read(block, total, 512 - total);
             if (read < 0) {
-                if (total == 0) return false;
+                if (total == 0) {
+                    return false;
+                }
                 throw new EOFException("Truncated tar header");
             }
             total += read;
@@ -154,8 +201,13 @@ public class TarInputStream extends FilterInputStream {
         return true;
     }
 
-    private boolean isZeroBlock() {
-        for (int i = 0; i < 512; i++) if (block[i] != 0) return false;
+    private boolean isZeroBlock()
+    {
+        for (int i = 0; i < 512; i++) {
+            if (block[i] != 0) {
+                return false;
+            }
+        }
         return true;
     }
 }

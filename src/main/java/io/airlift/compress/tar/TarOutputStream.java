@@ -26,27 +26,38 @@ import static java.nio.charset.StandardCharsets.UTF_8;
  * <p>
  * tar stores each entry's size in its header: each entrymust be written in full before it's closed.
  */
-public class TarOutputStream extends FilterOutputStream {
+public class TarOutputStream
+        extends FilterOutputStream
+{
     private final byte[] block = new byte[512];
     private long remaining;
     private int padding;
     private boolean entryOpen;
     private boolean finished;
 
-    public TarOutputStream(OutputStream out) {
+    public TarOutputStream(OutputStream out)
+    {
         super(out);
     }
 
-    public void putNextEntry(TarEntry entry) throws IOException {
-        if (entryOpen) throw new IOException("Previous entry was not closed");
-        if (finished) throw new IOException("Archive is finished");
+    public void putNextEntry(TarEntry entry)
+            throws IOException
+    {
+        if (entryOpen) {
+            throw new IOException("Previous entry was not closed");
+        }
+        if (finished) {
+            throw new IOException("Archive is finished");
+        }
         TarEntry header = entry;
         if (!entry.fitsUstar()) {
             // PAX (POSIX.1-2001): a preceding 'x' entry carries the values that don't fit the ustar fields;
             // the real header holds truncated fallbacks
             writePaxHeader(entry);
             String shortName = entry.getName().substring(0, Math.min(entry.getName().length(), 100));
-            if (entry.isDirectory() && !shortName.endsWith("/")) shortName = shortName.substring(0, 99) + "/";
+            if (entry.isDirectory() && !shortName.endsWith("/")) {
+                shortName = shortName.substring(0, 99) + "/";
+            }
             header = new TarEntry(shortName, entry.getSize(), entry.getMode()).setModTime(entry.getModTime());
         }
         header.writeHeader(block);
@@ -64,9 +75,15 @@ public class TarOutputStream extends FilterOutputStream {
     }
 
     @Override
-    public void write(byte[] buffer, int offset, int length) throws IOException {
-        if (!entryOpen) throw new IOException("No open entry");
-        if (length > remaining) throw new IOException("Write exceeds the declared entry size");
+    public void write(byte[] buffer, int offset, int length)
+            throws IOException
+    {
+        if (!entryOpen) {
+            throw new IOException("No open entry");
+        }
+        if (length > remaining) {
+            throw new IOException("Write exceeds the declared entry size");
+        }
         out.write(buffer, offset, length);
         remaining -= length;
     }
@@ -74,9 +91,15 @@ public class TarOutputStream extends FilterOutputStream {
     /**
      * Verifies the entry was written in full and pads it to the block boundary.ù
      */
-    public void closeEntry() throws IOException {
-        if (!entryOpen) return;
-        if (remaining != 0) throw new IOException(remaining + " bytes missing from the current entry");
+    public void closeEntry()
+            throws IOException
+    {
+        if (!entryOpen) {
+            return;
+        }
+        if (remaining != 0) {
+            throw new IOException(remaining + " bytes missing from the current entry");
+        }
         Arrays.fill(block, 0, padding, (byte) 0);
         out.write(block, 0, padding);
         entryOpen = false;
@@ -84,17 +107,22 @@ public class TarOutputStream extends FilterOutputStream {
 
     // A PAX record is "<len> <key>=<value>\n" where len counts the whole record,
     // its own digits included, so it is grown to account for digit-count changes
-    private static void paxRecord(StringBuilder records, String key, String value) {
+    private static void paxRecord(StringBuilder records, String key, String value)
+    {
         int base = key.length() + value.getBytes(UTF_8).length + 3; // space, '=', '\n'
         int total = base + Integer.toString(base).length();
         total = base + Integer.toString(total).length();
         records.append(total).append(' ').append(key).append('=').append(value).append('\n');
     }
 
-    private void writePaxHeader(TarEntry entry) throws IOException {
+    private void writePaxHeader(TarEntry entry)
+            throws IOException
+    {
         StringBuilder records = new StringBuilder();
         paxRecord(records, "path", entry.getName());
-        if (entry.getSize() > TarEntry.MAX_OCTAL) paxRecord(records, "size", Long.toString(entry.getSize()));
+        if (entry.getSize() > TarEntry.MAX_OCTAL) {
+            paxRecord(records, "size", Long.toString(entry.getSize()));
+        }
         byte[] data = records.toString().getBytes(UTF_8);
         String name = entry.getName();
         TarEntry pax = new TarEntry("./PaxHeaders/" + name.substring(0, Math.min(name.length(), 80)), data.length).setType('x');
@@ -109,9 +137,15 @@ public class TarOutputStream extends FilterOutputStream {
     /**
      * Writes the end-of-archive marker (two zero blocks). Called by close().
      */
-    public void finish() throws IOException {
-        if (entryOpen) throw new IOException("Current entry was not closed");
-        if (finished) return;
+    public void finish()
+            throws IOException
+    {
+        if (entryOpen) {
+            throw new IOException("Current entry was not closed");
+        }
+        if (finished) {
+            return;
+        }
         Arrays.fill(block, (byte) 0);
         out.write(block);
         out.write(block);
@@ -119,8 +153,12 @@ public class TarOutputStream extends FilterOutputStream {
     }
 
     @Override
-    public void close() throws IOException {
-        if (!finished) finish();
+    public void close()
+            throws IOException
+    {
+        if (!finished) {
+            finish();
+        }
         super.close();
     }
 }
