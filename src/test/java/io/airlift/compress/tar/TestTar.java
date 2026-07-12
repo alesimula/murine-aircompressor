@@ -96,6 +96,32 @@ public class TestTar {
     }
 
     @Test
+    public void testUnsplittableLongNameViaPax() throws IOException {
+        String name = new String(new char[200]).replace('\0', 'x'); // no slashes: needs PAX
+        byte[] archive = archive(new Object[][] {{name, pattern(7)}});
+        try (TarInputStream tar = new TarInputStream(new ByteArrayInputStream(archive))) {
+            TarEntry entry = tar.getNextEntry();
+            assertThat(entry.getName()).isEqualTo(name);
+            assertThat(entry.getSize()).isEqualTo(7);
+            assertThat(tar.getNextEntry()).isNull();
+        }
+    }
+
+    @Test
+    public void testPaxSizeRecordOverridesHeader() throws IOException {
+        // Craft what a PAX writer emits for an oversized entry: zeroed header size + size record
+        ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+        try (TarOutputStream tar = new TarOutputStream(buffer)) {
+            tar.putNextEntry(new TarEntry("small", 3));
+            tar.write(pattern(3));
+            tar.closeEntry();
+        }
+        try (TarInputStream tar = new TarInputStream(new ByteArrayInputStream(buffer.toByteArray()))) {
+            assertThat(tar.getNextEntry().getSize()).isEqualTo(3);
+        }
+    }
+
+    @Test
     public void testDirectoryEntry() throws IOException {
         byte[] archive = archive(new Object[][] {{"some/dir/", pattern(0)}});
         try (TarInputStream tar = new TarInputStream(new ByteArrayInputStream(archive))) {

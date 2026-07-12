@@ -18,13 +18,14 @@ import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 
+import static java.nio.charset.StandardCharsets.UTF_8;
+
 /**
  * Reads USTAR (POSIX.1-1988) archives with the java.util.zip.ZipInputStream
  * call sequence: getNextEntry until null, reading each entry's data in between.
  * <p>
- * Every header entry is surfaced as-is: PAX and GNU extension records
- * (long names, extended attributes) are returned as plain entries rather
- * than interpreted, and their data can be read or skipped like any other.
+ * PAX extended headers (path, size, mtime) and GNU long names are applied to
+ * the entry they precede; other extension records are consumed and ignored.
  */
 public class TarInputStream extends FilterInputStream {
     private final byte[] block = new byte[512];
@@ -60,10 +61,69 @@ public class TarInputStream extends FilterInputStream {
             eof = true; // end-of-archive marker (second zero block not required)
             return null;
         }
-        TarEntry entry = new TarEntry(block);
-        remaining = entry.getSize();
-        padding = (int) (-remaining & 511);
-        return entry;
+        String paxPath = null;
+        String paxSize = null;
+        String paxMtime = null;
+        String gnuName = null;
+        while (true) {
+            TarEntry entry = new TarEntry(block);
+            char type = entry.getType();
+            if (type == 'x' || type == 'g' || type == 'L' || type == 'K') {
+                byte[] data = readEntryData(entry);
+                if (type == 'x') {
+                    // "<len> <key>=<value>\n" records; len spans the whole record
+                    int at = 0;
+                    while (at < data.length) {
+                        int space = at;
+                        while (data[space] != ' ') space++;
+                        int end = at + Integer.parseInt(new String(data, at, space - at, UTF_8));
+                        String record = new String(data, space + 1, end - space - 2, UTF_8); // minus '\n'
+                        int eq = record.indexOf('=');
+                        String key = record.substring(0, eq);
+                        String value = record.substring(eq + 1);
+                        if (key.equals("path")) paxPath = value;
+                        else if (key.equals("size")) paxSize = value;
+                        else if (key.equals("mtime")) paxMtime = value;
+                        at = end;
+                    }
+                }
+                else if (type == 'L') {
+                    int end = 0;
+                    while (end < data.length && data[end] != 0) end++;
+                    gnuName = new String(data, 0, end, UTF_8);
+                }
+                // 'g' (global) and 'K' (long link) records are ignored
+                if (!readBlock()) throw new EOFException("Truncated tar archive");
+                continue;
+            }
+            if (gnuName != null) entry.setName(gnuName);
+            if (paxPath != null) entry.setName(paxPath);
+            if (paxSize != null) entry.setSize(Long.parseLong(paxSize));
+            if (paxMtime != null) entry.setModTime((long) (Double.parseDouble(paxMtime) * 1000));
+            remaining = entry.getSize();
+            padding = (int) (-remaining & 511);
+            return entry;
+        }
+    }
+
+    /** Reads an extension entry's data in full, including its padding. */
+    private byte[] readEntryData(TarEntry entry) throws IOException {
+        if (entry.getSize() > 1 << 20) throw new IOException("Oversized tar extension record");
+        int size = (int) entry.getSize();
+        byte[] data = new byte[size];
+        int total = 0;
+        while (total < size) {
+            int read = in.read(data, total, size - total);
+            if (read < 0) throw new EOFException("Truncated tar archive");
+            total += read;
+        }
+        long pad = -entry.getSize() & 511;
+        while (pad > 0) {
+            int read = in.read(block, 0, (int) pad);
+            if (read < 0) throw new EOFException("Truncated tar archive");
+            pad -= read;
+        }
+        return data;
     }
 
     @Override

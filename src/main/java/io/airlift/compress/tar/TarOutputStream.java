@@ -18,6 +18,8 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.util.Arrays;
 
+import static java.nio.charset.StandardCharsets.UTF_8;
+
 /**
  * Writes USTAR (POSIX.1-1988) archives with the java.util.zip.ZipOutputStream
  * call sequence: putNextEntry, write the data, closeEntry, repeat, close.
@@ -38,7 +40,16 @@ public class TarOutputStream extends FilterOutputStream {
     public void putNextEntry(TarEntry entry) throws IOException {
         if (entryOpen) throw new IOException("Previous entry was not closed");
         if (finished) throw new IOException("Archive is finished");
-        entry.writeHeader(block);
+        TarEntry header = entry;
+        if (!entry.fitsUstar()) {
+            // PAX (POSIX.1-2001): a preceding 'x' entry carries the values that don't fit the ustar fields;
+            // the real header holds truncated fallbacks
+            writePaxHeader(entry);
+            String shortName = entry.getName().substring(0, Math.min(entry.getName().length(), 100));
+            if (entry.isDirectory() && !shortName.endsWith("/")) shortName = shortName.substring(0, 99) + "/";
+            header = new TarEntry(shortName, entry.getSize(), entry.getMode()).setModTime(entry.getModTime());
+        }
+        header.writeHeader(block);
         out.write(block);
         remaining = entry.getSize();
         padding = (int) (-remaining & 511);
@@ -69,6 +80,30 @@ public class TarOutputStream extends FilterOutputStream {
         Arrays.fill(block, 0, padding, (byte) 0);
         out.write(block, 0, padding);
         entryOpen = false;
+    }
+
+    // A PAX record is "<len> <key>=<value>\n" where len counts the whole record,
+    // its own digits included, so it is grown to account for digit-count changes
+    private static void paxRecord(StringBuilder records, String key, String value) {
+        int base = key.length() + value.getBytes(UTF_8).length + 3; // space, '=', '\n'
+        int total = base + Integer.toString(base).length();
+        total = base + Integer.toString(total).length();
+        records.append(total).append(' ').append(key).append('=').append(value).append('\n');
+    }
+
+    private void writePaxHeader(TarEntry entry) throws IOException {
+        StringBuilder records = new StringBuilder();
+        paxRecord(records, "path", entry.getName());
+        if (entry.getSize() > TarEntry.MAX_OCTAL) paxRecord(records, "size", Long.toString(entry.getSize()));
+        byte[] data = records.toString().getBytes(UTF_8);
+        String name = entry.getName();
+        TarEntry pax = new TarEntry("./PaxHeaders/" + name.substring(0, Math.min(name.length(), 80)), data.length).setType('x');
+        pax.writeHeader(block);
+        out.write(block);
+        out.write(data);
+        int pad = -data.length & 511;
+        Arrays.fill(block, 0, pad, (byte) 0);
+        out.write(block, 0, pad);
     }
 
     /**

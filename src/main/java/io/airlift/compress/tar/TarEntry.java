@@ -26,9 +26,9 @@ public class TarEntry {
     public static final char TYPE_FILE = '0';
     public static final char TYPE_DIRECTORY = '5';
 
-    // Sizes are stored as 11 octal digits, so 8 GiB - 1 is the format limit.
-    // TODO upgrade: PAX size records or GNU base-256
-    private static final long MAX_SIZE = 077777777777L;
+    // Largest value an 11-octal-digit field can hold (8 GiB - 1); bigger sizes
+    // are written through a PAX record and read through PAX or GNU base-256.
+    static final long MAX_OCTAL = 077777777777L;
 
     private String name;
     private long size;
@@ -74,13 +74,7 @@ public class TarEntry {
         String suffix = name;
         if (suffix.length() > 100) {
             // ustar name split: prefix field holds the leading directories
-            int slash = -1;
-            for (int i = name.indexOf('/'); i >= 0; i = name.indexOf('/', i + 1)) {
-                if (i <= 155 && name.length() - i - 1 <= 100) {
-                    slash = i;
-                    break;
-                }
-            }
+            int slash = splitPoint(name);
             if (slash < 0) throw new IllegalArgumentException("Entry name too long for ustar: " + name);
             writeString(block, 345, 155, name.substring(0, slash));
             suffix = name.substring(slash + 1);
@@ -89,7 +83,9 @@ public class TarEntry {
         writeOctal(block, 100, 8, mode);
         writeOctal(block, 108, 8, 0); // uid
         writeOctal(block, 116, 8, 0); // gid
-        writeOctal(block, 124, 12, size);
+        // Oversized entries carry their real size in a PAX record; the header field
+        // is zeroed like bsdtar does, and readers take the PAX value
+        writeOctal(block, 124, 12, size > MAX_OCTAL ? 0 : size);
         writeOctal(block, 136, 12, modTime / 1000);
         block[156] = (byte) type;
         writeString(block, 257, 8, "ustar\000" + "00");
@@ -109,7 +105,7 @@ public class TarEntry {
     }
 
     public TarEntry setSize(long size) {
-        if (size < 0 || size > MAX_SIZE) throw new IllegalArgumentException("Invalid entry size: " + size);
+        if (size < 0) throw new IllegalArgumentException("Invalid entry size: " + size);
         this.size = size;
         return this;
     }
@@ -146,6 +142,31 @@ public class TarEntry {
         return type;
     }
 
+    /**
+     * True when name and size fit plain ustar fields; otherwise a PAX header is needed.
+     */
+    boolean fitsUstar() {
+        return size <= MAX_OCTAL && (name.getBytes(US_ASCII).length <= 100 || splitPoint(name) >= 0);
+    }
+
+    TarEntry setType(char type) {
+        this.type = type;
+        return this;
+    }
+
+    TarEntry setName(String name) {
+        this.name = name;
+        return this;
+    }
+
+    // ustar name split: index of the '/' whose prefix and suffix fit their fields, or -1
+    private static int splitPoint(String name) {
+        for (int i = name.indexOf('/'); i >= 0; i = name.indexOf('/', i + 1)) {
+            if (i <= 155 && name.length() - i - 1 <= 100) return i;
+        }
+        return -1;
+    }
+
     private static long checksum(byte[] header, boolean signed) {
         long sum = 0;
         for (int i = 0; i < 512; i++) {
@@ -156,7 +177,12 @@ public class TarEntry {
     }
 
     private static long parseOctal(byte[] block, int offset, int length) throws IOException {
-        if ((block[offset] & 0x80) != 0) throw new IOException("GNU base-256 numeric fields are not supported");
+        if ((block[offset] & 0x80) != 0) {
+            // GNU base-256: high bit marks a big-endian binary field
+            long value = block[offset] & 0x7F;
+            for (int i = offset + 1; i < offset + length; i++) value = (value << 8) | (block[i] & 0xFF);
+            return value;
+        }
         long value = 0;
         for (int i = offset; i < offset + length; i++) {
             int b = block[i];
