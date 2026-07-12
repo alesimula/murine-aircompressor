@@ -73,6 +73,46 @@ byte[] uncompressed = new byte[data.length];
 int uncompressedSize = decompressor.decompress(compressed, 0, compressedSize, uncompressed, 0, uncompressed.length);
 ```
 
+# Archive Formats
+
+Archive formats bundle multiple files into a single stream. They are independent
+of compression: wrap the output in one of the streaming compressors (e.g.
+`ZstdOutputStream`) to get a compressed archive.
+
+## [Tar](https://en.wikipedia.org/wiki/Tar_(computing))
+Tar is the standard utility and file format for data archiving in Unix-like systems.
+This implementation writes and reads USTAR (POSIX.1-1988) archives and is deliberately 
+modeled on the JDK's `java.util.zip.ZipInputStream` / `ZipOutputStream`, so the call 
+sequence is familiar.
+
+The implementation is provided by `TarOutputStream` and `TarInputStream`, with
+each member described by a `TarEntry`. Writing follows the zip idiom:
+`putNextEntry`, write the data, `closeEntry`, repeat, then `close`; for reading:
+call `getNextEntry` until it returns `null`, reading each entry's data in between.
+
+The size of each entry must be known up front and is passed to the `TarEntry` constructor 
+(`new TarEntry(name, size)`). Names or sizes too large for the plain USTAR fields are
+handled transparently, written as PAX (POSIX.1-2001) extended headers, and read
+back from PAX or GNU extension records.
+
+```java
+// Writing (optionally wrap `out` in ZstdOutputStream for a compressed .tar.zst)
+try (TarOutputStream tar = new TarOutputStream(out)) {
+    byte[] data = ...
+    tar.putNextEntry(new TarEntry("hello.txt", data.length));
+    tar.write(data);
+    tar.closeEntry();
+}
+
+// Reading (wrap `in` in ZstdInputStream to read a .tar.zst)
+try (TarInputStream tar = new TarInputStream(in)) {
+    TarEntry entry;
+    while ((entry = tar.getNextEntry()) != null) {
+        // read entry data from `tar` up to entry.getSize()
+    }
+}
+```
+
 # Algorithms
 
 ## [Zstandard (Zstd)](https://facebook.github.io/zstd) **(Recommended)**
