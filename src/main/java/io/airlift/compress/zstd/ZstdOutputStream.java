@@ -32,6 +32,7 @@ public class ZstdOutputStream
     private final OutputStream outputStream;
     private final CompressionContext context;
     private final int maxBufferSize;
+    private final WindowSlideMode windowSlideMode;
 
     private XxHash64 partialHash;
 
@@ -56,7 +57,26 @@ public class ZstdOutputStream
     public ZstdOutputStream(OutputStream outputStream, int compressionLevel)
             throws IOException
     {
+        this(outputStream, compressionLevel, WindowSlideMode.HIGH_COMPRESSION);
+    }
+
+    public ZstdOutputStream(OutputStream outputStream, WindowSlideMode windowSlideMode)
+            throws IOException
+    {
+        this(outputStream, DEFAULT_COMPRESSION_LEVEL, windowSlideMode);
+    }
+
+    /**
+     * Creates a compressing stream with zstd
+     * @param outputStream the wrapped output stream
+     * @param compressionLevel compression level (0-22, default 3)
+     * @param windowSlideMode see {@link WindowSlideMode}
+     */
+    public ZstdOutputStream(OutputStream outputStream, int compressionLevel, WindowSlideMode windowSlideMode)
+            throws IOException
+    {
         this.outputStream = requireNonNull(outputStream, "outputStream is null");
+        this.windowSlideMode = requireNonNull(windowSlideMode, "windowSlideMode is null");
         CompressionParameters parameters = CompressionParameters.compute(compressionLevel, -1);
         CompressionParameters.checkLevelSupported(parameters, compressionLevel);
         this.context = new CompressionContext(parameters, ARRAY_BYTE_BASE_OFFSET, Integer.MAX_VALUE);
@@ -222,7 +242,7 @@ public class ZstdOutputStream
         else {
             // slide window forward, leaving the entire window and the unprocessed data
             int slideWindowSize = uncompressedOffset - context.parameters.getWindowSize();
-            context.slideWindow(slideWindowSize);
+            context.slideWindow(slideWindowSize, windowSlideMode.rebasesWindow());
 
             System.arraycopy(uncompressed, slideWindowSize, uncompressed, 0, context.parameters.getWindowSize() + (uncompressedPosition - uncompressedOffset));
             uncompressedOffset -= slideWindowSize;

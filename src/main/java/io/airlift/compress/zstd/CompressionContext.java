@@ -42,10 +42,10 @@ class CompressionContext
         blockCompressionState = new BlockCompressionState(parameters, baseAddress);
     }
 
-    public void slideWindow(int slideWindowSize)
+    public void slideWindow(int slideWindowSize, boolean rebaseWindowBase)
     {
         checkArgument(slideWindowSize > 0, "slideWindowSize must be positive");
-        blockCompressionState.slideWindow(slideWindowSize);
+        blockCompressionState.slideWindow(slideWindowSize, rebaseWindowBase);
     }
 
     public void commit()
