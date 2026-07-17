@@ -26,8 +26,9 @@ import static io.airlift.compress.zstd.Util.minTableLog;
 
 final class HuffmanCompressionTable
 {
-    private final short[] values;
-    private final byte[] numberOfBits;
+    // ARM/ART: package-private so HuffmanCompressor can hoist these into locals (see SequenceEncoder)
+    final short[] values;
+    final byte[] numberOfBits;
 
     private int maxSymbol;
     private int maxNumberOfBits;

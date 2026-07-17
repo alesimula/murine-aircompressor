@@ -87,27 +87,45 @@ class HuffmanCompressor
             return 0;
         }
 
-        BitOutputStream bitstream = new BitOutputStream(outputBase, outputAddress, outputSize);
+        // ARM/ART: Highly optimized, flattened version of SequenceEncoder.encodeSequences.
+        // By moving the Huffman tables and bit container into local variables, it eliminates object-field
+        // loads and method calls, generating bit-identical output with maximum performance on ARM/ART.
+        final short[] symbolValues = table.values;
+        final byte[] symbolBits = table.numberOfBits;
+        final long bosLimit = outputAddress + outputSize - SIZE_OF_LONG;
+        long container = 0;
+        int bitCount = 0;
+        long currentAddress = outputAddress;
         long input = inputAddress;
 
         int n = inputSize & ~3; // join to mod 4
+        int symbol;
+        int flushedBytes;
 
         switch (inputSize & 3) {
             case 3:
-                table.encodeSymbol(bitstream, UNSAFE.getByte(inputBase, input + n + 2) & 0xFF);
-                if (SIZE_OF_LONG * 8 < Huffman.MAX_TABLE_LOG * 4 + 7) {
-                    bitstream.flush();
-                }
+                symbol = UNSAFE.getByte(inputBase, input + n + 2) & 0xFF;
+                container |= ((long) symbolValues[symbol]) << bitCount;
+                bitCount += symbolBits[symbol];
                 // fall-through
             case 2:
-                table.encodeSymbol(bitstream, UNSAFE.getByte(inputBase, input + n + 1) & 0xFF);
-                if (SIZE_OF_LONG * 8 < Huffman.MAX_TABLE_LOG * 2 + 7) {
-                    bitstream.flush();
-                }
+                symbol = UNSAFE.getByte(inputBase, input + n + 1) & 0xFF;
+                container |= ((long) symbolValues[symbol]) << bitCount;
+                bitCount += symbolBits[symbol];
                 // fall-through
             case 1:
-                table.encodeSymbol(bitstream, UNSAFE.getByte(inputBase, input + n + 0) & 0xFF);
-                bitstream.flush();
+                symbol = UNSAFE.getByte(inputBase, input + n + 0) & 0xFF;
+                container |= ((long) symbolValues[symbol]) << bitCount;
+                bitCount += symbolBits[symbol];
+                // flush
+                flushedBytes = bitCount >>> 3;
+                UNSAFE.putLong(outputBase, currentAddress, container);
+                currentAddress += flushedBytes;
+                if (currentAddress > bosLimit) {
+                    currentAddress = bosLimit;
+                }
+                bitCount &= 7;
+                container >>>= flushedBytes * 8;
                 // fall-through
             case 0: /* fall-through */
             default:
@@ -115,22 +133,43 @@ class HuffmanCompressor
         }
 
         for (; n > 0; n -= 4) {  // note: n & 3 == 0 at this stage
-            table.encodeSymbol(bitstream, UNSAFE.getByte(inputBase, input + n - 1) & 0xFF);
-            if (SIZE_OF_LONG * 8 < Huffman.MAX_TABLE_LOG * 2 + 7) {
-                bitstream.flush();
+            symbol = UNSAFE.getByte(inputBase, input + n - 1) & 0xFF;
+            container |= ((long) symbolValues[symbol]) << bitCount;
+            bitCount += symbolBits[symbol];
+            symbol = UNSAFE.getByte(inputBase, input + n - 2) & 0xFF;
+            container |= ((long) symbolValues[symbol]) << bitCount;
+            bitCount += symbolBits[symbol];
+            symbol = UNSAFE.getByte(inputBase, input + n - 3) & 0xFF;
+            container |= ((long) symbolValues[symbol]) << bitCount;
+            bitCount += symbolBits[symbol];
+            symbol = UNSAFE.getByte(inputBase, input + n - 4) & 0xFF;
+            container |= ((long) symbolValues[symbol]) << bitCount;
+            bitCount += symbolBits[symbol];
+            // flush
+            flushedBytes = bitCount >>> 3;
+            UNSAFE.putLong(outputBase, currentAddress, container);
+            currentAddress += flushedBytes;
+            if (currentAddress > bosLimit) {
+                currentAddress = bosLimit;
             }
-            table.encodeSymbol(bitstream, UNSAFE.getByte(inputBase, input + n - 2) & 0xFF);
-            if (SIZE_OF_LONG * 8 < Huffman.MAX_TABLE_LOG * 4 + 7) {
-                bitstream.flush();
-            }
-            table.encodeSymbol(bitstream, UNSAFE.getByte(inputBase, input + n - 3) & 0xFF);
-            if (SIZE_OF_LONG * 8 < Huffman.MAX_TABLE_LOG * 2 + 7) {
-                bitstream.flush();
-            }
-            table.encodeSymbol(bitstream, UNSAFE.getByte(inputBase, input + n - 4) & 0xFF);
-            bitstream.flush();
+            bitCount &= 7;
+            container >>>= flushedBytes * 8;
         }
 
-        return bitstream.close();
+        // BitOutputStream.close(): end mark + final flush
+        container |= 1L << bitCount;
+        bitCount += 1;
+        flushedBytes = bitCount >>> 3;
+        UNSAFE.putLong(outputBase, currentAddress, container);
+        currentAddress += flushedBytes;
+        if (currentAddress > bosLimit) {
+            currentAddress = bosLimit;
+        }
+        bitCount &= 7;
+
+        if (currentAddress >= bosLimit) {
+            return 0;
+        }
+        return (int) ((currentAddress - outputAddress) + (bitCount > 0 ? 1 : 0));
     }
 }

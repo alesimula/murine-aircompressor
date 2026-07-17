@@ -17,11 +17,13 @@ import static io.airlift.compress.zstd.FiniteStateEntropy.MAX_SYMBOL;
 
 class FseCompressionTable
 {
-    private final short[] nextState;
-    private final int[] deltaNumberOfBits;
-    private final int[] deltaFindState;
+    // ARM/ART: package-private so SequenceEncoder can hoist these into locals in its hot loop
+    // (avoids per-call reference-field loads, each of which carries a GC read barrier on ART).
+    final short[] nextState;
+    final int[] deltaNumberOfBits;
+    final int[] deltaFindState;
 
-    private int log2Size;
+    int log2Size;
 
     public FseCompressionTable(int maxTableLog, int maxSymbol)
     {

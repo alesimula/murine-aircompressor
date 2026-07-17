@@ -27,6 +27,7 @@ import static io.airlift.compress.zstd.Constants.OFFSET_TABLE_LOG;
 import static io.airlift.compress.zstd.Constants.SEQUENCE_ENCODING_BASIC;
 import static io.airlift.compress.zstd.Constants.SEQUENCE_ENCODING_COMPRESSED;
 import static io.airlift.compress.zstd.Constants.SEQUENCE_ENCODING_RLE;
+import static io.airlift.compress.zstd.Constants.SIZE_OF_LONG;
 import static io.airlift.compress.zstd.Constants.SIZE_OF_SHORT;
 import static io.airlift.compress.zstd.FiniteStateEntropy.optimalTableLog;
 import static io.airlift.compress.zstd.Util.checkArgument;
@@ -246,20 +247,61 @@ class SequenceEncoder
         byte[] matchLengthCodes = sequences.matchLengthCodes;
         byte[] offsetCodes = sequences.offsetCodes;
         byte[] literalLengthCodes = sequences.literalLengthCodes;
+        int[] literalLengthValues = sequences.literalLengths;
+        int[] matchLengthValues = sequences.matchLengths;
+        int[] offsetValues = sequences.offsets;
 
-        BitOutputStream blockStream = new BitOutputStream(outputBase, output, (int) (outputLimit - output));
+        // ARM/ART: Flattened loop optimized for ARM/ART, mirroring native zstd (ZSTD_encodeSequences_body).
+        // Storing FSE tables and the bit container in locals bypasses costly ART JIT call overhead
+        // and concurrent-copying GC read barriers, producing bit-identical output.
+        short[] mlNextState = matchLengthTable.nextState;
+        int[] mlDeltaBits = matchLengthTable.deltaNumberOfBits;
+        int[] mlDeltaFind = matchLengthTable.deltaFindState;
+        short[] offNextState = offsetsTable.nextState;
+        int[] offDeltaBits = offsetsTable.deltaNumberOfBits;
+        int[] offDeltaFind = offsetsTable.deltaFindState;
+        short[] llNextState = literalLengthTable.nextState;
+        int[] llDeltaBits = literalLengthTable.deltaNumberOfBits;
+        int[] llDeltaFind = literalLengthTable.deltaFindState;
+
+        int outputSize = (int) (outputLimit - output);
+        checkArgument(outputSize >= SIZE_OF_LONG, "Output buffer too small");
+        final long bosLimit = output + outputSize - SIZE_OF_LONG;
+        long container = 0;
+        int bitCount = 0;
+        long currentAddress = output;
 
         int sequenceCount = sequences.sequenceCount;
 
-        // first symbols
-        int matchLengthState = matchLengthTable.begin(matchLengthCodes[sequenceCount - 1]);
-        int offsetState = offsetsTable.begin(offsetCodes[sequenceCount - 1]);
-        int literalLengthState = literalLengthTable.begin(literalLengthCodes[sequenceCount - 1]);
+        // first symbols (FseCompressionTable.begin)
+        int mlSymbol = matchLengthCodes[sequenceCount - 1];
+        int mlBeginBits = (mlDeltaBits[mlSymbol] + (1 << 15)) >>> 16;
+        int matchLengthState = mlNextState[(((mlBeginBits << 16) - mlDeltaBits[mlSymbol]) >>> mlBeginBits) + mlDeltaFind[mlSymbol]];
+        int offSymbol = offsetCodes[sequenceCount - 1];
+        int offBeginBits = (offDeltaBits[offSymbol] + (1 << 15)) >>> 16;
+        int offsetState = offNextState[(((offBeginBits << 16) - offDeltaBits[offSymbol]) >>> offBeginBits) + offDeltaFind[offSymbol]];
+        int llSymbol = literalLengthCodes[sequenceCount - 1];
+        int llBeginBits = (llDeltaBits[llSymbol] + (1 << 15)) >>> 16;
+        int literalLengthState = llNextState[(((llBeginBits << 16) - llDeltaBits[llSymbol]) >>> llBeginBits) + llDeltaFind[llSymbol]];
 
-        blockStream.addBits(sequences.literalLengths[sequenceCount - 1], LITERALS_LENGTH_BITS[literalLengthCodes[sequenceCount - 1]]);
-        blockStream.addBits(sequences.matchLengths[sequenceCount - 1], MATCH_LENGTH_BITS[matchLengthCodes[sequenceCount - 1]]);
-        blockStream.addBits(sequences.offsets[sequenceCount - 1], offsetCodes[sequenceCount - 1]);
-        blockStream.flush();
+        int bits = LITERALS_LENGTH_BITS[literalLengthCodes[sequenceCount - 1]];
+        container |= (literalLengthValues[sequenceCount - 1] & ((1L << bits) - 1)) << bitCount;
+        bitCount += bits;
+        bits = MATCH_LENGTH_BITS[matchLengthCodes[sequenceCount - 1]];
+        container |= (matchLengthValues[sequenceCount - 1] & ((1L << bits) - 1)) << bitCount;
+        bitCount += bits;
+        bits = offsetCodes[sequenceCount - 1];
+        container |= (offsetValues[sequenceCount - 1] & ((1L << bits) - 1)) << bitCount;
+        bitCount += bits;
+        // flush
+        int flushedBytes = bitCount >>> 3;
+        UNSAFE.putLong(outputBase, currentAddress, container);
+        currentAddress += flushedBytes;
+        if (currentAddress > bosLimit) {
+            currentAddress = bosLimit;
+        }
+        bitCount &= 7;
+        container >>>= flushedBytes * 8;
 
         if (sequenceCount >= 2) {
             for (int n = sequenceCount - 2; n >= 0; n--) {
@@ -272,34 +314,126 @@ class SequenceEncoder
                 int matchLengthBits = MATCH_LENGTH_BITS[matchLengthCode];
 
                 // (7)
-                offsetState = offsetsTable.encode(blockStream, offsetState, offsetCode); // 15
-                matchLengthState = matchLengthTable.encode(blockStream, matchLengthState, matchLengthCode); // 24
-                literalLengthState = literalLengthTable.encode(blockStream, literalLengthState, literalLengthCode); // 33
+                // offsetState = offsetsTable.encode(blockStream, offsetState, offsetCode); // 15
+                int stateBits = (offsetState + offDeltaBits[offsetCode]) >>> 16;
+                container |= (offsetState & ((1L << stateBits) - 1)) << bitCount;
+                bitCount += stateBits;
+                offsetState = offNextState[(offsetState >>> stateBits) + offDeltaFind[offsetCode]];
+                // matchLengthState = matchLengthTable.encode(blockStream, matchLengthState, matchLengthCode); // 24
+                stateBits = (matchLengthState + mlDeltaBits[matchLengthCode]) >>> 16;
+                container |= (matchLengthState & ((1L << stateBits) - 1)) << bitCount;
+                bitCount += stateBits;
+                matchLengthState = mlNextState[(matchLengthState >>> stateBits) + mlDeltaFind[matchLengthCode]];
+                // literalLengthState = literalLengthTable.encode(blockStream, literalLengthState, literalLengthCode); // 33
+                stateBits = (literalLengthState + llDeltaBits[literalLengthCode]) >>> 16;
+                container |= (literalLengthState & ((1L << stateBits) - 1)) << bitCount;
+                bitCount += stateBits;
+                literalLengthState = llNextState[(literalLengthState >>> stateBits) + llDeltaFind[literalLengthCode]];
 
                 if ((offsetBits + matchLengthBits + literalLengthBits >= 64 - 7 - (LITERAL_LENGTH_TABLE_LOG + MATCH_LENGTH_TABLE_LOG + OFFSET_TABLE_LOG))) {
-                    blockStream.flush();                                /* (7)*/
+                    flushedBytes = bitCount >>> 3;                      /* (7)*/
+                    UNSAFE.putLong(outputBase, currentAddress, container);
+                    currentAddress += flushedBytes;
+                    if (currentAddress > bosLimit) {
+                        currentAddress = bosLimit;
+                    }
+                    bitCount &= 7;
+                    container >>>= flushedBytes * 8;
                 }
 
-                blockStream.addBits(sequences.literalLengths[n], literalLengthBits);
+                container |= (literalLengthValues[n] & ((1L << literalLengthBits) - 1)) << bitCount;
+                bitCount += literalLengthBits;
                 if (((literalLengthBits + matchLengthBits) > 24)) {
-                    blockStream.flush();
+                    flushedBytes = bitCount >>> 3;
+                    UNSAFE.putLong(outputBase, currentAddress, container);
+                    currentAddress += flushedBytes;
+                    if (currentAddress > bosLimit) {
+                        currentAddress = bosLimit;
+                    }
+                    bitCount &= 7;
+                    container >>>= flushedBytes * 8;
                 }
 
-                blockStream.addBits(sequences.matchLengths[n], matchLengthBits);
+                container |= (matchLengthValues[n] & ((1L << matchLengthBits) - 1)) << bitCount;
+                bitCount += matchLengthBits;
                 if ((offsetBits + matchLengthBits + literalLengthBits > 56)) {
-                    blockStream.flush();
+                    flushedBytes = bitCount >>> 3;
+                    UNSAFE.putLong(outputBase, currentAddress, container);
+                    currentAddress += flushedBytes;
+                    if (currentAddress > bosLimit) {
+                        currentAddress = bosLimit;
+                    }
+                    bitCount &= 7;
+                    container >>>= flushedBytes * 8;
                 }
 
-                blockStream.addBits(sequences.offsets[n], offsetBits); // 31
-                blockStream.flush(); // (7)
+                container |= (offsetValues[n] & ((1L << offsetBits) - 1)) << bitCount; // 31
+                bitCount += offsetBits;
+                // flush (7)
+                flushedBytes = bitCount >>> 3;
+                UNSAFE.putLong(outputBase, currentAddress, container);
+                currentAddress += flushedBytes;
+                if (currentAddress > bosLimit) {
+                    currentAddress = bosLimit;
+                }
+                bitCount &= 7;
+                container >>>= flushedBytes * 8;
             }
         }
 
-        matchLengthTable.finish(blockStream, matchLengthState);
-        offsetsTable.finish(blockStream, offsetState);
-        literalLengthTable.finish(blockStream, literalLengthState);
+        // matchLengthTable.finish / offsetsTable.finish / literalLengthTable.finish
+        container |= (matchLengthState & ((1L << matchLengthTable.log2Size) - 1)) << bitCount;
+        bitCount += matchLengthTable.log2Size;
+        flushedBytes = bitCount >>> 3;
+        UNSAFE.putLong(outputBase, currentAddress, container);
+        currentAddress += flushedBytes;
+        if (currentAddress > bosLimit) {
+            currentAddress = bosLimit;
+        }
+        bitCount &= 7;
+        container >>>= flushedBytes * 8;
 
-        int streamSize = blockStream.close();
+        container |= (offsetState & ((1L << offsetsTable.log2Size) - 1)) << bitCount;
+        bitCount += offsetsTable.log2Size;
+        flushedBytes = bitCount >>> 3;
+        UNSAFE.putLong(outputBase, currentAddress, container);
+        currentAddress += flushedBytes;
+        if (currentAddress > bosLimit) {
+            currentAddress = bosLimit;
+        }
+        bitCount &= 7;
+        container >>>= flushedBytes * 8;
+
+        container |= (literalLengthState & ((1L << literalLengthTable.log2Size) - 1)) << bitCount;
+        bitCount += literalLengthTable.log2Size;
+        flushedBytes = bitCount >>> 3;
+        UNSAFE.putLong(outputBase, currentAddress, container);
+        currentAddress += flushedBytes;
+        if (currentAddress > bosLimit) {
+            currentAddress = bosLimit;
+        }
+        bitCount &= 7;
+        container >>>= flushedBytes * 8;
+
+        // BitOutputStream.close(): end mark + final flush
+        container |= 1L << bitCount;
+        bitCount += 1;
+        flushedBytes = bitCount >>> 3;
+        UNSAFE.putLong(outputBase, currentAddress, container);
+        currentAddress += flushedBytes;
+        if (currentAddress > bosLimit) {
+            currentAddress = bosLimit;
+        }
+        bitCount &= 7;
+        container >>>= flushedBytes * 8;
+
+        int streamSize;
+        if (currentAddress >= bosLimit) {
+            streamSize = 0;
+        }
+        else {
+            streamSize = (int) ((currentAddress - output) + (bitCount > 0 ? 1 : 0));
+        }
         checkArgument(streamSize > 0, "Output buffer too small");
 
         return streamSize;
