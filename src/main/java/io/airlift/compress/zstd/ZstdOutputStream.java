@@ -26,25 +26,44 @@ import static java.lang.Math.max;
 import static java.lang.Math.min;
 import static java.util.Objects.requireNonNull;
 
+/**
+ * Zstd compressing stream. See {@link BufferMode} for the two buffering strategies; both honour
+ * {@link WindowSlideMode} and produce standard zstd frames.
+ */
 public class ZstdOutputStream
         extends OutputStream
 {
+    // Ring mode: windows of history kept in the ring before a slide is needed. 2 bounds the
+    // footprint to ~2.1 MB at level 3 (vs ~4.2 MB for the sliding buffer) while amortizing the
+    // slide to exactly one window-sized arraycopy every 8 blocks - a fixed, evenly spread cost,
+    // chosen for run-to-run consistency on cache-constrained devices.
+    private static final int RING_WINDOW_MULTIPLIER = 2;
+
     private final OutputStream outputStream;
     private final CompressionContext context;
-    private final int maxBufferSize;
     private final WindowSlideMode windowSlideMode;
+    private final boolean ringMode;
+    private final byte[] compressed;
+    private final int windowSize;
+    private final int blockSize;
 
     private XxHash64 partialHash;
+    private boolean closed;
 
+    // SLIDING_WINDOW mode state (original implementation, unchanged)
+    private final int maxBufferSize;
     private byte[] uncompressed = new byte[0];
-    private final byte[] compressed;
-
     // start of unprocessed data in uncompressed buffer
     private int uncompressedOffset;
     // end of unprocessed data in uncompressed buffer
     private int uncompressedPosition;
 
-    private boolean closed;
+    // RING_BUFFER mode state
+    private final byte[] ring;
+    private boolean ringHeaderWritten;
+    private int ringPosition;
+    private int ringBlockBegin;
+    private int ringBlockEnd;
 
     public ZstdOutputStream(OutputStream outputStream)
             throws IOException
@@ -66,27 +85,59 @@ public class ZstdOutputStream
         this(outputStream, DEFAULT_COMPRESSION_LEVEL, windowSlideMode);
     }
 
+    public ZstdOutputStream(OutputStream outputStream, BufferMode bufferMode)
+            throws IOException
+    {
+        this(outputStream, DEFAULT_COMPRESSION_LEVEL, WindowSlideMode.HIGH_COMPRESSION, bufferMode);
+    }
+
+    public ZstdOutputStream(OutputStream outputStream, int compressionLevel, BufferMode bufferMode)
+            throws IOException
+    {
+        this(outputStream, compressionLevel, WindowSlideMode.HIGH_COMPRESSION, bufferMode);
+    }
+
+    public ZstdOutputStream(OutputStream outputStream, int compressionLevel, WindowSlideMode windowSlideMode)
+            throws IOException
+    {
+        this(outputStream, compressionLevel, windowSlideMode, BufferMode.RING_BUFFER);
+    }
+
     /**
      * Creates a compressing stream with zstd
      * @param outputStream the wrapped output stream
      * @param compressionLevel compression level (0-22, default 3)
      * @param windowSlideMode see {@link WindowSlideMode}
+     * @param bufferMode see {@link BufferMode}; {@link BufferMode#RING_BUFFER} is the default
      */
-    public ZstdOutputStream(OutputStream outputStream, int compressionLevel, WindowSlideMode windowSlideMode)
+    public ZstdOutputStream(OutputStream outputStream, int compressionLevel, WindowSlideMode windowSlideMode, BufferMode bufferMode)
             throws IOException
     {
         this.outputStream = requireNonNull(outputStream, "outputStream is null");
         this.windowSlideMode = requireNonNull(windowSlideMode, "windowSlideMode is null");
+        this.ringMode = requireNonNull(bufferMode, "bufferMode is null") == BufferMode.RING_BUFFER;
         CompressionParameters parameters = CompressionParameters.compute(compressionLevel, -1);
         CompressionParameters.checkLevelSupported(parameters, compressionLevel);
         this.context = new CompressionContext(parameters, ARRAY_BYTE_BASE_OFFSET, Integer.MAX_VALUE);
-        this.maxBufferSize = context.parameters.getWindowSize() * 4;
+        this.windowSize = parameters.getWindowSize();
+        this.blockSize = parameters.getBlockSize();
 
         // create output buffer large enough for a single block
-        int bufferSize = context.parameters.getBlockSize() + SIZE_OF_BLOCK_HEADER;
+        int bufferSize = blockSize + SIZE_OF_BLOCK_HEADER;
         // todo is the "+ (bufferSize >>> 8)" required here?
         // add extra long to give code more leeway
         this.compressed = new byte[bufferSize + (bufferSize >>> 8) + SIZE_OF_LONG];
+
+        if (ringMode) {
+            // everything allocated once, up front: no growth reallocations, no per-write work
+            this.maxBufferSize = 0;
+            this.ring = new byte[windowSize * RING_WINDOW_MULTIPLIER + blockSize];
+            this.ringBlockEnd = blockSize;
+        }
+        else {
+            this.maxBufferSize = windowSize * 4;
+            this.ring = null;
+        }
     }
 
     @Override
@@ -95,6 +146,14 @@ public class ZstdOutputStream
     {
         if (closed) {
             throw new IOException("Stream is closed");
+        }
+
+        if (ringMode) {
+            if (ringPosition == ringBlockEnd) {
+                completeRingBlock();
+            }
+            ring[ringPosition++] = (byte) b;
+            return;
         }
 
         growBufferIfNecessary(1);
@@ -119,6 +178,32 @@ public class ZstdOutputStream
             throw new IOException("Stream is closed");
         }
 
+        if (ringMode) {
+            // ARM/ART hot path: a plain bounded copy loop with all state in locals; everything
+            // that happens once per block lives in the outlined completeRingBlock() (hot/cold
+            // split - ART compiles a method as one register-allocation unit)
+            byte[] ring = this.ring;
+            int position = this.ringPosition;
+            int blockEnd = this.ringBlockEnd;
+            while (length > 0) {
+                int space = blockEnd - position;
+                if (space == 0) {
+                    this.ringPosition = position;
+                    completeRingBlock();
+                    position = this.ringPosition;
+                    blockEnd = this.ringBlockEnd;
+                    space = blockEnd - position;
+                }
+                int writeSize = min(space, length);
+                System.arraycopy(buffer, offset, ring, position, writeSize);
+                position += writeSize;
+                offset += writeSize;
+                length -= writeSize;
+            }
+            this.ringPosition = position;
+            return;
+        }
+
         growBufferIfNecessary(length);
 
         while (length > 0) {
@@ -133,6 +218,118 @@ public class ZstdOutputStream
         }
     }
 
+    // visible for Hadoop stream
+    void finishWithoutClosingSource()
+            throws IOException
+    {
+        if (!closed) {
+            if (ringMode) {
+                finishRing();
+            }
+            else {
+                writeChunk(true);
+            }
+            closed = true;
+        }
+    }
+
+    @Override
+    public void close()
+            throws IOException
+    {
+        if (!closed) {
+            if (ringMode) {
+                finishRing();
+            }
+            else {
+                writeChunk(true);
+            }
+
+            closed = true;
+            outputStream.close();
+        }
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // RING_BUFFER mode. Data is compressed in place from a fixed ring; when the ring wraps, the
+    // last window is kept as match history (arraycopy to the front) and the compression state is
+    // re-anchored through CompressionContext.slideWindow honouring WindowSlideMode.
+    // ------------------------------------------------------------------------------------------
+
+    // cold path, runs once per completed block
+    private void completeRingBlock()
+            throws IOException
+    {
+        compressRingBlock(false);
+
+        // advance to the next block slot (only full blocks reach here)
+        int blockBegin = ringBlockBegin + blockSize;
+        int blockEnd = ringBlockEnd + blockSize;
+        if (blockEnd > ring.length) {
+            int slide = blockBegin - windowSize;
+            if (slide > 0) {
+                context.slideWindow(slide, windowSlideMode.rebasesWindow());
+                System.arraycopy(ring, slide, ring, 0, windowSize);
+                blockBegin = windowSize;
+                blockEnd = windowSize + blockSize;
+            }
+            else {
+                blockBegin = 0;
+                blockEnd = blockSize;
+            }
+        }
+        ringBlockBegin = blockBegin;
+        ringBlockEnd = blockEnd;
+        ringPosition = blockBegin;
+    }
+
+    private void compressRingBlock(boolean lastBlock)
+            throws IOException
+    {
+        if (!ringHeaderWritten) {
+            ringHeaderWritten = true;
+            partialHash = new XxHash64();
+
+            int outputAddress = ARRAY_BYTE_BASE_OFFSET;
+            outputAddress += ZstdFrameCompressor.writeMagic(compressed, outputAddress, outputAddress + 4);
+            outputAddress += ZstdFrameCompressor.writeFrameHeader(compressed, outputAddress, outputAddress + 14, -1, windowSize);
+            outputStream.write(compressed, 0, outputAddress - ARRAY_BYTE_BASE_OFFSET);
+        }
+
+        int blockContentSize = ringPosition - ringBlockBegin;
+        if (blockContentSize > 0) {
+            partialHash.update(ring, ringBlockBegin, blockContentSize);
+        }
+
+        int compressedSize = ZstdFrameCompressor.writeCompressedBlock(
+                ring,
+                ARRAY_BYTE_BASE_OFFSET + ringBlockBegin,
+                blockContentSize,
+                compressed,
+                ARRAY_BYTE_BASE_OFFSET,
+                compressed.length,
+                context,
+                lastBlock);
+        outputStream.write(compressed, 0, compressedSize);
+    }
+
+    private void finishRing()
+            throws IOException
+    {
+        compressRingBlock(true);
+
+        // write checksum
+        int hash = (int) partialHash.hash();
+        outputStream.write(hash);
+        outputStream.write(hash >> 8);
+        outputStream.write(hash >> 16);
+        outputStream.write(hash >> 24);
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // SLIDING_WINDOW mode (original implementation, unchanged behaviour)
+    // ------------------------------------------------------------------------------------------
+
     private void growBufferIfNecessary(int length)
     {
         if (uncompressedPosition + length <= uncompressed.length || uncompressed.length >= maxBufferSize) {
@@ -144,7 +341,7 @@ public class ZstdOutputStream
         // limit to max buffer size
         newSize = min(newSize, maxBufferSize);
         // allocate at least a minimal buffer to start;
-        newSize = max(newSize, context.parameters.getBlockSize());
+        newSize = max(newSize, blockSize);
         uncompressed = Arrays.copyOf(uncompressed, newSize);
     }
 
@@ -154,30 +351,8 @@ public class ZstdOutputStream
         // only flush when the buffer if is max size, full, and the buffer is larger than the window and one additional block
         if (uncompressed.length >= maxBufferSize &&
                 uncompressedPosition == uncompressed.length &&
-                uncompressed.length - context.parameters.getWindowSize() > context.parameters.getBlockSize()) {
+                uncompressed.length - windowSize > blockSize) {
             writeChunk(false);
-        }
-    }
-
-    // visible for Hadoop stream
-    void finishWithoutClosingSource()
-            throws IOException
-    {
-        if (!closed) {
-            writeChunk(true);
-            closed = true;
-        }
-    }
-
-    @Override
-    public void close()
-            throws IOException
-    {
-        if (!closed) {
-            writeChunk(true);
-
-            closed = true;
-            outputStream.close();
         }
     }
 
@@ -190,8 +365,7 @@ public class ZstdOutputStream
             chunkSize = uncompressedPosition - uncompressedOffset;
         }
         else {
-            int blockSize = context.parameters.getBlockSize();
-            chunkSize = uncompressedPosition - uncompressedOffset - context.parameters.getWindowSize() - blockSize;
+            chunkSize = uncompressedPosition - uncompressedOffset - windowSize - blockSize;
             checkState(chunkSize > blockSize, "Must write at least one full block");
             // only write full blocks
             chunkSize = (chunkSize / blockSize) * blockSize;
@@ -206,7 +380,7 @@ public class ZstdOutputStream
 
             int outputAddress = ARRAY_BYTE_BASE_OFFSET;
             outputAddress += ZstdFrameCompressor.writeMagic(compressed, outputAddress, outputAddress + 4);
-            outputAddress += ZstdFrameCompressor.writeFrameHeader(compressed, outputAddress, outputAddress + 14, inputSize, context.parameters.getWindowSize());
+            outputAddress += ZstdFrameCompressor.writeFrameHeader(compressed, outputAddress, outputAddress + 14, inputSize, windowSize);
             outputStream.write(compressed, 0, outputAddress - ARRAY_BYTE_BASE_OFFSET);
         }
 
@@ -215,19 +389,19 @@ public class ZstdOutputStream
         // write one block at a time
         // note this is a do while to ensure that zero length input gets at least one block written
         do {
-            int blockSize = min(chunkSize, context.parameters.getBlockSize());
+            int size = min(chunkSize, blockSize);
             int compressedSize = ZstdFrameCompressor.writeCompressedBlock(
                     uncompressed,
                     ARRAY_BYTE_BASE_OFFSET + uncompressedOffset,
-                    blockSize,
+                    size,
                     compressed,
                     ARRAY_BYTE_BASE_OFFSET,
                     compressed.length,
                     context,
-                    lastChunk && blockSize == chunkSize);
+                    lastChunk && size == chunkSize);
             outputStream.write(compressed, 0, compressedSize);
-            uncompressedOffset += blockSize;
-            chunkSize -= blockSize;
+            uncompressedOffset += size;
+            chunkSize -= size;
         }
         while (chunkSize > 0);
 
@@ -241,10 +415,10 @@ public class ZstdOutputStream
         }
         else {
             // slide window forward, leaving the entire window and the unprocessed data
-            int slideWindowSize = uncompressedOffset - context.parameters.getWindowSize();
+            int slideWindowSize = uncompressedOffset - windowSize;
             context.slideWindow(slideWindowSize, windowSlideMode.rebasesWindow());
 
-            System.arraycopy(uncompressed, slideWindowSize, uncompressed, 0, context.parameters.getWindowSize() + (uncompressedPosition - uncompressedOffset));
+            System.arraycopy(uncompressed, slideWindowSize, uncompressed, 0, windowSize + (uncompressedPosition - uncompressedOffset));
             uncompressedOffset -= slideWindowSize;
             uncompressedPosition -= slideWindowSize;
         }
