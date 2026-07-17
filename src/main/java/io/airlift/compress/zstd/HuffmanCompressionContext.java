@@ -21,6 +21,10 @@ class HuffmanCompressionContext
     private HuffmanCompressionTable previousTable = new HuffmanCompressionTable(Huffman.MAX_SYMBOL_COUNT);
     private HuffmanCompressionTable temporaryTable = new HuffmanCompressionTable(Huffman.MAX_SYMBOL_COUNT);
 
+    // reusable histogram buffers for encodeLiterals
+    final int[] literalsCounts = new int[Huffman.MAX_SYMBOL_COUNT];
+    final int[] histogramLanes = new int[Histogram.LANES_SIZE];
+
     private HuffmanCompressionTable previousCandidate = previousTable;
     private HuffmanCompressionTable temporaryCandidate = temporaryTable;
 

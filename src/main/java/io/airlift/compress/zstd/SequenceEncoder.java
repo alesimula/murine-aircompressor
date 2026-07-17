@@ -100,7 +100,7 @@ class SequenceEncoder
 
         // literal lengths
         int[] counts = workspace.counts;
-        Histogram.count(sequences.literalLengthCodes, sequenceCount, workspace.counts);
+        Histogram.count(sequences.literalLengthCodes, sequenceCount, workspace.counts, workspace.histogramLanes);
         maxSymbol = Histogram.findMaxSymbol(counts, MAX_LITERALS_LENGTH_SYMBOL);
         largestCount = Histogram.findLargestCount(counts, maxSymbol);
 
@@ -136,7 +136,7 @@ class SequenceEncoder
         }
 
         // offsets
-        Histogram.count(sequences.offsetCodes, sequenceCount, workspace.counts);
+        Histogram.count(sequences.offsetCodes, sequenceCount, workspace.counts, workspace.histogramLanes);
         maxSymbol = Histogram.findMaxSymbol(counts, MAX_OFFSET_CODE_SYMBOL);
         largestCount = Histogram.findLargestCount(counts, maxSymbol);
 
@@ -175,7 +175,7 @@ class SequenceEncoder
         }
 
         // match lengths
-        Histogram.count(sequences.matchLengthCodes, sequenceCount, workspace.counts);
+        Histogram.count(sequences.matchLengthCodes, sequenceCount, workspace.counts, workspace.histogramLanes);
         maxSymbol = Histogram.findMaxSymbol(counts, MAX_MATCH_LENGTH_SYMBOL);
         largestCount = Histogram.findLargestCount(counts, maxSymbol);
 

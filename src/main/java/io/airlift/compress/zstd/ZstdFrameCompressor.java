@@ -280,8 +280,8 @@ class ZstdFrameCompressor
 
         checkArgument(headerSize + 1 <= outputSize, "Output buffer too small");
 
-        int[] counts = new int[MAX_SYMBOL_COUNT]; // TODO: preallocate
-        Histogram.count(literals, literalsSize, counts);
+        int[] counts = context.literalsCounts;
+        Histogram.count(literals, literalsSize, counts, context.histogramLanes);
         int maxSymbol = Histogram.findMaxSymbol(counts, MAX_SYMBOL);
         int largestCount = Histogram.findLargestCount(counts, maxSymbol);
 
