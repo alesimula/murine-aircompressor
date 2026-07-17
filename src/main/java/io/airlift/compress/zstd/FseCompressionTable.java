@@ -25,11 +25,18 @@ class FseCompressionTable
 
     int log2Size;
 
+    // ARM/ART: scratch buffers for initialize(), allocated once per table instead of per block
+    // (all FseCompressionTable instances are long-lived; per-block allocation is pure GC churn,
+    // which ART's concurrent GC pays for more heavily than HotSpot).
+    private final byte[] spreadScratch;
+    private final int[] cumulativeScratch = new int[MAX_SYMBOL + 2];
+
     public FseCompressionTable(int maxTableLog, int maxSymbol)
     {
         nextState = new short[1 << maxTableLog];
         deltaNumberOfBits = new int[maxSymbol + 1];
         deltaFindState = new int[maxSymbol + 1];
+        spreadScratch = new byte[1 << maxTableLog];
     }
 
     public static FseCompressionTable newInstance(short[] normalizedCounts, int maxSymbol, int tableLog)
@@ -55,7 +62,7 @@ class FseCompressionTable
     {
         int tableSize = 1 << tableLog;
 
-        byte[] table = new byte[tableSize]; // TODO: allocate in workspace
+        byte[] table = spreadScratch; // reused scratch; entries [0, tableSize) are fully overwritten below
         int highThreshold = tableSize - 1;
 
         // TODO: make sure FseCompressionTable has enough size
@@ -65,7 +72,7 @@ class FseCompressionTable
         // http://fastcompression.blogspot.fr/2014/02/fse-distributing-symbol-values.html
 
         // symbol start positions
-        int[] cumulative = new int[MAX_SYMBOL + 2]; // TODO: allocate in workspace
+        int[] cumulative = cumulativeScratch; // reused scratch; entries [0, maxSymbol + 1] are written before use
         cumulative[0] = 0;
         for (int i = 1; i <= maxSymbol + 1; i++) {
             if (normalizedCounts[i - 1] == -1) {  // Low probability symbol

@@ -121,10 +121,19 @@ class SequenceStore
 
     public void generateCodes()
     {
-        for (int i = 0; i < sequenceCount; ++i) {
-            literalLengthCodes[i] = (byte) literalLengthToCode(literalLengths[i]);
-            offsetCodes[i] = (byte) Util.highestBit(offsets[i]);
-            matchLengthCodes[i] = (byte) matchLengthToCode(matchLengths[i]);
+        // ARM/ART: arrays hoisted into locals so the loop does no reference-field loads per
+        // iteration (read-barrier cost on ART; HotSpot hoists these itself).
+        int count = sequenceCount;
+        byte[] llCodes = literalLengthCodes;
+        byte[] offCodes = offsetCodes;
+        byte[] mlCodes = matchLengthCodes;
+        int[] llValues = literalLengths;
+        int[] offValues = offsets;
+        int[] mlValues = matchLengths;
+        for (int i = 0; i < count; ++i) {
+            llCodes[i] = (byte) literalLengthToCode(llValues[i]);
+            offCodes[i] = (byte) Util.highestBit(offValues[i]);
+            mlCodes[i] = (byte) matchLengthToCode(mlValues[i]);
         }
 
         if (longLengthField == LongField.LITERAL) {
