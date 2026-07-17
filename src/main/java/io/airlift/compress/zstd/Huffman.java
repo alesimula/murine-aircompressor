@@ -129,12 +129,10 @@ class Huffman
 
     public void decodeSingleStream(final Object inputBase, final long inputAddress, final long inputLimit, final Object outputBase, final long outputAddress, final long outputLimit)
     {
-        BitInputStream.Initializer initializer = new BitInputStream.Initializer(inputBase, inputAddress, inputLimit);
-        initializer.initialize();
-
-        long bits = initializer.getBits();
-        int bitsConsumed = initializer.getBitsConsumed();
-        long currentAddress = initializer.getCurrentAddress();
+        long[] scratch = new long[2]; // one per call; refills below are allocation-free (see BitInputStream)
+        int bitsConsumed = BitInputStream.initializeBits(inputBase, inputAddress, inputLimit, scratch);
+        long bits = scratch[0];
+        long currentAddress = scratch[1];
 
         int tableLog = this.tableLog;
         byte[] numbersOfBits = this.numbersOfBits;
@@ -144,12 +142,11 @@ class Huffman
         long output = outputAddress;
         long fastOutputLimit = outputLimit - 4;
         while (output < fastOutputLimit) {
-            BitInputStream.Loader loader = new BitInputStream.Loader(inputBase, inputAddress, currentAddress, bits, bitsConsumed);
-            boolean done = loader.load();
-            bits = loader.getBits();
-            bitsConsumed = loader.getBitsConsumed();
-            currentAddress = loader.getCurrentAddress();
-            if (done) {
+            int loaded = BitInputStream.loadBits(inputBase, inputAddress, currentAddress, bits, bitsConsumed, scratch);
+            bits = scratch[0];
+            currentAddress = scratch[1];
+            bitsConsumed = loaded & BitInputStream.LOAD_BITS_CONSUMED_MASK;
+            if ((loaded & BitInputStream.LOAD_DONE) != 0) {
                 break;
             }
 
@@ -174,29 +171,22 @@ class Huffman
 
         verify(start2 < start3 && start3 < start4 && start4 < inputLimit, inputAddress, "Input is corrupted");
 
-        BitInputStream.Initializer initializer = new BitInputStream.Initializer(inputBase, start1, start2);
-        initializer.initialize();
-        int stream1bitsConsumed = initializer.getBitsConsumed();
-        long stream1currentAddress = initializer.getCurrentAddress();
-        long stream1bits = initializer.getBits();
+        long[] scratch = new long[2]; // one per call; refills below are allocation-free (see BitInputStream)
+        int stream1bitsConsumed = BitInputStream.initializeBits(inputBase, start1, start2, scratch);
+        long stream1bits = scratch[0];
+        long stream1currentAddress = scratch[1];
 
-        initializer = new BitInputStream.Initializer(inputBase, start2, start3);
-        initializer.initialize();
-        int stream2bitsConsumed = initializer.getBitsConsumed();
-        long stream2currentAddress = initializer.getCurrentAddress();
-        long stream2bits = initializer.getBits();
+        int stream2bitsConsumed = BitInputStream.initializeBits(inputBase, start2, start3, scratch);
+        long stream2bits = scratch[0];
+        long stream2currentAddress = scratch[1];
 
-        initializer = new BitInputStream.Initializer(inputBase, start3, start4);
-        initializer.initialize();
-        int stream3bitsConsumed = initializer.getBitsConsumed();
-        long stream3currentAddress = initializer.getCurrentAddress();
-        long stream3bits = initializer.getBits();
+        int stream3bitsConsumed = BitInputStream.initializeBits(inputBase, start3, start4, scratch);
+        long stream3bits = scratch[0];
+        long stream3currentAddress = scratch[1];
 
-        initializer = new BitInputStream.Initializer(inputBase, start4, inputLimit);
-        initializer.initialize();
-        int stream4bitsConsumed = initializer.getBitsConsumed();
-        long stream4currentAddress = initializer.getCurrentAddress();
-        long stream4bits = initializer.getBits();
+        int stream4bitsConsumed = BitInputStream.initializeBits(inputBase, start4, inputLimit, scratch);
+        long stream4bits = scratch[0];
+        long stream4currentAddress = scratch[1];
 
         int segmentSize = (int) ((outputLimit - outputAddress + 3) / 4);
 
@@ -240,41 +230,35 @@ class Huffman
             output3 += SIZE_OF_INT;
             output4 += SIZE_OF_INT;
 
-            BitInputStream.Loader loader = new BitInputStream.Loader(inputBase, start1, stream1currentAddress, stream1bits, stream1bitsConsumed);
-            boolean done = loader.load();
-            stream1bitsConsumed = loader.getBitsConsumed();
-            stream1bits = loader.getBits();
-            stream1currentAddress = loader.getCurrentAddress();
-
-            if (done) {
+            int loaded = BitInputStream.loadBits(inputBase, start1, stream1currentAddress, stream1bits, stream1bitsConsumed, scratch);
+            stream1bits = scratch[0];
+            stream1currentAddress = scratch[1];
+            stream1bitsConsumed = loaded & BitInputStream.LOAD_BITS_CONSUMED_MASK;
+            if ((loaded & BitInputStream.LOAD_DONE) != 0) {
                 break;
             }
 
-            loader = new BitInputStream.Loader(inputBase, start2, stream2currentAddress, stream2bits, stream2bitsConsumed);
-            done = loader.load();
-            stream2bitsConsumed = loader.getBitsConsumed();
-            stream2bits = loader.getBits();
-            stream2currentAddress = loader.getCurrentAddress();
-
-            if (done) {
+            loaded = BitInputStream.loadBits(inputBase, start2, stream2currentAddress, stream2bits, stream2bitsConsumed, scratch);
+            stream2bits = scratch[0];
+            stream2currentAddress = scratch[1];
+            stream2bitsConsumed = loaded & BitInputStream.LOAD_BITS_CONSUMED_MASK;
+            if ((loaded & BitInputStream.LOAD_DONE) != 0) {
                 break;
             }
 
-            loader = new BitInputStream.Loader(inputBase, start3, stream3currentAddress, stream3bits, stream3bitsConsumed);
-            done = loader.load();
-            stream3bitsConsumed = loader.getBitsConsumed();
-            stream3bits = loader.getBits();
-            stream3currentAddress = loader.getCurrentAddress();
-            if (done) {
+            loaded = BitInputStream.loadBits(inputBase, start3, stream3currentAddress, stream3bits, stream3bitsConsumed, scratch);
+            stream3bits = scratch[0];
+            stream3currentAddress = scratch[1];
+            stream3bitsConsumed = loaded & BitInputStream.LOAD_BITS_CONSUMED_MASK;
+            if ((loaded & BitInputStream.LOAD_DONE) != 0) {
                 break;
             }
 
-            loader = new BitInputStream.Loader(inputBase, start4, stream4currentAddress, stream4bits, stream4bitsConsumed);
-            done = loader.load();
-            stream4bitsConsumed = loader.getBitsConsumed();
-            stream4bits = loader.getBits();
-            stream4currentAddress = loader.getCurrentAddress();
-            if (done) {
+            loaded = BitInputStream.loadBits(inputBase, start4, stream4currentAddress, stream4bits, stream4bitsConsumed, scratch);
+            stream4bits = scratch[0];
+            stream4currentAddress = scratch[1];
+            stream4bitsConsumed = loaded & BitInputStream.LOAD_BITS_CONSUMED_MASK;
+            if ((loaded & BitInputStream.LOAD_DONE) != 0) {
                 break;
             }
         }
@@ -290,18 +274,18 @@ class Huffman
 
     private void decodeTail(final Object inputBase, final long startAddress, long currentAddress, int bitsConsumed, long bits, final Object outputBase, long outputAddress, final long outputLimit)
     {
+        long[] scratch = new long[2]; // one per call; refills below are allocation-free
         int tableLog = this.tableLog;
         byte[] numbersOfBits = this.numbersOfBits;
         byte[] symbols = this.symbols;
 
         // closer to the end
         while (outputAddress < outputLimit) {
-            BitInputStream.Loader loader = new BitInputStream.Loader(inputBase, startAddress, currentAddress, bits, bitsConsumed);
-            boolean done = loader.load();
-            bitsConsumed = loader.getBitsConsumed();
-            bits = loader.getBits();
-            currentAddress = loader.getCurrentAddress();
-            if (done) {
+            int loaded = BitInputStream.loadBits(inputBase, startAddress, currentAddress, bits, bitsConsumed, scratch);
+            bits = scratch[0];
+            currentAddress = scratch[1];
+            bitsConsumed = loaded & BitInputStream.LOAD_BITS_CONSUMED_MASK;
+            if ((loaded & BitInputStream.LOAD_DONE) != 0) {
                 break;
             }
 

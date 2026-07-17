@@ -76,6 +76,86 @@ class BitInputStream
         return ((bitContainer << bitsConsumed) >>> (64 - numberOfBits));
     }
 
+    // ARM/ART: allocation-free equivalents of Initializer/Loader below. HotSpot's escape
+    // analysis scalar-replaces those short-lived objects to nothing; ART has no escape analysis,
+    // so in the decode hot loops every one of them was a real heap allocation plus object-field
+    // round-trips. These helpers keep all state in locals/registers: bits and currentAddress are
+    // returned through a caller-owned scratch (scratch[0] = bits, scratch[1] = currentAddress) and
+    // bitsConsumed comes back in the low bits of the return value with two flag bits.
+    static final int LOAD_DONE = 1 << 8;
+    static final int LOAD_OVERFLOW = 1 << 9;
+    static final int LOAD_BITS_CONSUMED_MASK = (1 << 8) - 1;
+
+    static int initializeBits(Object inputBase, long startAddress, long endAddress, long[] scratch)
+    {
+        verify(endAddress - startAddress >= 1, startAddress, "Bitstream is empty");
+
+        int lastByte = UNSAFE.getByte(inputBase, endAddress - 1) & 0xFF;
+        verify(lastByte != 0, endAddress, "Bitstream end mark not present");
+
+        int bitsConsumed = SIZE_OF_LONG - highestBit(lastByte);
+
+        long currentAddress;
+        long bits;
+        int inputSize = (int) (endAddress - startAddress);
+        if (inputSize >= SIZE_OF_LONG) {  /* normal case */
+            currentAddress = endAddress - SIZE_OF_LONG;
+            bits = UNSAFE.getLong(inputBase, currentAddress);
+        }
+        else {
+            currentAddress = startAddress;
+            bits = readTail(inputBase, startAddress, inputSize);
+
+            bitsConsumed += (SIZE_OF_LONG - inputSize) * 8;
+        }
+
+        scratch[0] = bits;
+        scratch[1] = currentAddress;
+        return bitsConsumed;
+    }
+
+    static int loadBits(Object inputBase, long startAddress, long currentAddress, long bits, int bitsConsumed, long[] scratch)
+    {
+        // identical logic to Loader.load()
+        if (bitsConsumed > 64) {
+            scratch[0] = bits;
+            scratch[1] = currentAddress;
+            return bitsConsumed | LOAD_DONE | LOAD_OVERFLOW;
+        }
+        if (currentAddress == startAddress) {
+            scratch[0] = bits;
+            scratch[1] = currentAddress;
+            return bitsConsumed | LOAD_DONE;
+        }
+
+        int bytes = bitsConsumed >>> 3; // divide by 8
+        if (currentAddress >= startAddress + SIZE_OF_LONG) {
+            if (bytes > 0) {
+                currentAddress -= bytes;
+                bits = UNSAFE.getLong(inputBase, currentAddress);
+            }
+            bitsConsumed &= 0b111;
+        }
+        else if (currentAddress - bytes < startAddress) {
+            bytes = (int) (currentAddress - startAddress);
+            currentAddress = startAddress;
+            bitsConsumed -= bytes * SIZE_OF_LONG;
+            bits = UNSAFE.getLong(inputBase, startAddress);
+            scratch[0] = bits;
+            scratch[1] = currentAddress;
+            return bitsConsumed | LOAD_DONE;
+        }
+        else {
+            currentAddress -= bytes;
+            bitsConsumed -= bytes * SIZE_OF_LONG;
+            bits = UNSAFE.getLong(inputBase, currentAddress);
+        }
+
+        scratch[0] = bits;
+        scratch[1] = currentAddress;
+        return bitsConsumed;
+    }
+
     static class Initializer
     {
         private final Object inputBase;

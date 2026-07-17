@@ -354,11 +354,10 @@ class ZstdFrameDecompressor
             input = computeMatchLengthTable(matchLengthType, inputBase, input, inputLimit);
 
             // decompress sequences
-            BitInputStream.Initializer initializer = new BitInputStream.Initializer(inputBase, input, inputLimit);
-            initializer.initialize();
-            int bitsConsumed = initializer.getBitsConsumed();
-            long bits = initializer.getBits();
-            long currentAddress = initializer.getCurrentAddress();
+            long[] scratch = new long[2]; // one per block; per-sequence refills below are allocation-free
+            int bitsConsumed = BitInputStream.initializeBits(inputBase, input, inputLimit, scratch);
+            long bits = scratch[0];
+            long currentAddress = scratch[1];
 
             FiniteStateEntropy.Table currentLiteralsLengthTable = this.currentLiteralsLengthTable;
             FiniteStateEntropy.Table currentOffsetCodesTable = this.currentOffsetCodesTable;
@@ -390,12 +389,11 @@ class ZstdFrameDecompressor
             while (sequenceCount > 0) {
                 sequenceCount--;
 
-                BitInputStream.Loader loader = new BitInputStream.Loader(inputBase, input, currentAddress, bits, bitsConsumed);
-                loader.load();
-                bitsConsumed = loader.getBitsConsumed();
-                bits = loader.getBits();
-                currentAddress = loader.getCurrentAddress();
-                if (loader.isOverflow()) {
+                int loaded = BitInputStream.loadBits(inputBase, input, currentAddress, bits, bitsConsumed, scratch);
+                bits = scratch[0];
+                currentAddress = scratch[1];
+                bitsConsumed = loaded & BitInputStream.LOAD_BITS_CONSUMED_MASK;
+                if ((loaded & BitInputStream.LOAD_OVERFLOW) != 0) {
                     verify(sequenceCount == 0, input, "Not all sequences were consumed");
                     break;
                 }
@@ -465,12 +463,10 @@ class ZstdFrameDecompressor
 
                 int totalBits = literalsLengthBits + matchLengthBits + offsetBits;
                 if (totalBits > 64 - 7 - (LITERAL_LENGTH_TABLE_LOG + MATCH_LENGTH_TABLE_LOG + OFFSET_TABLE_LOG)) {
-                    BitInputStream.Loader loader1 = new BitInputStream.Loader(inputBase, input, currentAddress, bits, bitsConsumed);
-                    loader1.load();
-
-                    bitsConsumed = loader1.getBitsConsumed();
-                    bits = loader1.getBits();
-                    currentAddress = loader1.getCurrentAddress();
+                    int reloaded = BitInputStream.loadBits(inputBase, input, currentAddress, bits, bitsConsumed, scratch);
+                    bits = scratch[0];
+                    currentAddress = scratch[1];
+                    bitsConsumed = reloaded & BitInputStream.LOAD_BITS_CONSUMED_MASK;
                 }
 
                 int numberOfBits;
