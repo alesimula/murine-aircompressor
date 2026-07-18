@@ -372,6 +372,14 @@ class ZstdFrameDecompressor
             int matchLengthState = (int) peekBits(bitsConsumed, bits, currentMatchLengthTable.log2Size);
             bitsConsumed += currentMatchLengthTable.log2Size;
 
+            // ARM/ART: hoist the static code tables - a static array access is a barriered
+            // reference load per use on ART; these were read up to 5x per decoded sequence
+            int[] literalsLengthBitsTable = LITERALS_LENGTH_BITS;
+            int[] matchLengthBitsTable = MATCH_LENGTH_BITS;
+            int[] literalsLengthBaseTable = LITERALS_LENGTH_BASE;
+            int[] matchLengthBaseTable = MATCH_LENGTH_BASE;
+            int[] offsetCodesBaseTable = OFFSET_CODES_BASE;
+
             int[] previousOffsets = this.previousOffsets;
 
             byte[] literalsLengthNumbersOfBits = currentLiteralsLengthTable.numberOfBits;
@@ -403,11 +411,11 @@ class ZstdFrameDecompressor
                 int matchLengthCode = matchLengthSymbols[matchLengthState];
                 int offsetCode = offsetCodesSymbols[offsetCodesState];
 
-                int literalsLengthBits = LITERALS_LENGTH_BITS[literalsLengthCode];
-                int matchLengthBits = MATCH_LENGTH_BITS[matchLengthCode];
+                int literalsLengthBits = literalsLengthBitsTable[literalsLengthCode];
+                int matchLengthBits = matchLengthBitsTable[matchLengthCode];
                 int offsetBits = offsetCode;
 
-                int offset = OFFSET_CODES_BASE[offsetCode];
+                int offset = offsetCodesBaseTable[offsetCode];
                 if (offsetCode > 0) {
                     offset += peekBits(bitsConsumed, bits, offsetBits);
                     bitsConsumed += offsetBits;
@@ -449,13 +457,13 @@ class ZstdFrameDecompressor
                     previousOffsets[0] = offset;
                 }
 
-                int matchLength = MATCH_LENGTH_BASE[matchLengthCode];
+                int matchLength = matchLengthBaseTable[matchLengthCode];
                 if (matchLengthCode > 31) {
                     matchLength += peekBits(bitsConsumed, bits, matchLengthBits);
                     bitsConsumed += matchLengthBits;
                 }
 
-                int literalsLength = LITERALS_LENGTH_BASE[literalsLengthCode];
+                int literalsLength = literalsLengthBaseTable[literalsLengthCode];
                 if (literalsLengthCode > 15) {
                     literalsLength += peekBits(bitsConsumed, bits, literalsLengthBits);
                     bitsConsumed += literalsLengthBits;

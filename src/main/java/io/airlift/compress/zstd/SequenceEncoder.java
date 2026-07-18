@@ -254,6 +254,11 @@ class SequenceEncoder
         // ARM/ART: Flattened loop optimized for ARM/ART, mirroring native zstd (ZSTD_encodeSequences_body).
         // Storing FSE tables and the bit container in locals bypasses costly ART JIT call overhead
         // and concurrent-copying GC read barriers, producing bit-identical output.
+        // ARM/ART: hoist the static code-bits tables too - a static array access is a barriered
+        // reference load per use on ART; these were read 2x per sequence in the loop below
+        int[] literalsLengthBits = LITERALS_LENGTH_BITS;
+        int[] matchLengthBitsTable = MATCH_LENGTH_BITS;
+
         short[] mlNextState = matchLengthTable.nextState;
         int[] mlDeltaBits = matchLengthTable.deltaNumberOfBits;
         int[] mlDeltaFind = matchLengthTable.deltaFindState;
@@ -284,10 +289,10 @@ class SequenceEncoder
         int llBeginBits = (llDeltaBits[llSymbol] + (1 << 15)) >>> 16;
         int literalLengthState = llNextState[(((llBeginBits << 16) - llDeltaBits[llSymbol]) >>> llBeginBits) + llDeltaFind[llSymbol]];
 
-        int bits = LITERALS_LENGTH_BITS[literalLengthCodes[sequenceCount - 1]];
+        int bits = literalsLengthBits[literalLengthCodes[sequenceCount - 1]];
         container |= (literalLengthValues[sequenceCount - 1] & ((1L << bits) - 1)) << bitCount;
         bitCount += bits;
-        bits = MATCH_LENGTH_BITS[matchLengthCodes[sequenceCount - 1]];
+        bits = matchLengthBitsTable[matchLengthCodes[sequenceCount - 1]];
         container |= (matchLengthValues[sequenceCount - 1] & ((1L << bits) - 1)) << bitCount;
         bitCount += bits;
         bits = offsetCodes[sequenceCount - 1];
@@ -309,9 +314,9 @@ class SequenceEncoder
                 byte offsetCode = offsetCodes[n];
                 byte matchLengthCode = matchLengthCodes[n];
 
-                int literalLengthBits = LITERALS_LENGTH_BITS[literalLengthCode];
+                int literalLengthBits = literalsLengthBits[literalLengthCode];
                 int offsetBits = offsetCode;
-                int matchLengthBits = MATCH_LENGTH_BITS[matchLengthCode];
+                int matchLengthBits = matchLengthBitsTable[matchLengthCode];
 
                 // (7)
                 // offsetState = offsetsTable.encode(blockStream, offsetState, offsetCode); // 15

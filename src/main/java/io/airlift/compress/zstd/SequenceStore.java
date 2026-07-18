@@ -130,10 +130,16 @@ class SequenceStore
         int[] llValues = literalLengths;
         int[] offValues = offsets;
         int[] mlValues = matchLengths;
+        // ARM/ART: static code tables hoisted (barriered reference load per access on ART);
+        // helper logic inlined - identical results
+        byte[] literalLengthCode = LITERAL_LENGTH_CODE;
+        byte[] matchLengthCode = MATCH_LENGTH_CODE;
         for (int i = 0; i < count; ++i) {
-            llCodes[i] = (byte) literalLengthToCode(llValues[i]);
+            int literalLength = llValues[i];
+            llCodes[i] = literalLength >= 64 ? (byte) (Util.highestBit(literalLength) + 19) : literalLengthCode[literalLength];
             offCodes[i] = (byte) Util.highestBit(offValues[i]);
-            mlCodes[i] = (byte) matchLengthToCode(mlValues[i]);
+            int matchLengthBase = mlValues[i];
+            mlCodes[i] = matchLengthBase >= 128 ? (byte) (Util.highestBit(matchLengthBase) + 36) : matchLengthCode[matchLengthBase];
         }
 
         if (longLengthField == LongField.LITERAL) {
