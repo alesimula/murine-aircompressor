@@ -13,6 +13,7 @@
  */
 package io.airlift.compress.zstd;
 
+import static io.airlift.compress.UnsafeUtil.ARRAY_BYTE_BASE_OFFSET;
 import static io.airlift.compress.UnsafeUtil.UNSAFE;
 import static io.airlift.compress.zstd.Constants.SIZE_OF_INT;
 import static io.airlift.compress.zstd.Constants.SIZE_OF_LONG;
@@ -82,13 +83,44 @@ class DoubleFastBlockCompressor
 
         final long[] cursor = new long[4]; // one tiny allocation per 128 KB block
 
+        // ARM/ART: resolve the short-hash function ONCE (it is loop-invariant). The hash() helper
+        // re-reads the 8 bytes at `input` through Unsafe and dispatches a switch on every position;
+        // C2 inlines and folds all of that away, ART may not. hash5..hash8 share the shape
+        // ((value << leftShift) * prime) >>> (64 - bits), so the scan loop below computes the hash
+        // directly from currentLong; searchLength 4 (int hash) keeps its own formula.
+        final boolean intShortHash = matchSearchLength == 4;
+        final long shortHashPrime;
+        final int shortHashLeftShift;
+        switch (matchSearchLength) {
+            case 5:
+                shortHashPrime = PRIME_5_BYTES;
+                shortHashLeftShift = Long.SIZE - 40;
+                break;
+            case 6:
+                shortHashPrime = PRIME_6_BYTES;
+                shortHashLeftShift = Long.SIZE - 48;
+                break;
+            case 7:
+                shortHashPrime = PRIME_7_BYTES;
+                shortHashLeftShift = Long.SIZE - 56;
+                break;
+            default:
+                shortHashPrime = PRIME_8_BYTES;
+                shortHashLeftShift = 0;
+                break;
+        }
+        final int shortHashRightShift = Long.SIZE - shortHashBits;
+        final int intHashRightShift = Integer.SIZE - shortHashBits;
+
         while (input < inputLimit) {   // < instead of <=, because repcode check at (input+1)
             // single read of the 8 bytes at `input`, reused for the long hash, the long-match
             // compare and the repcode compare ((int) (currentLong >>> 8) == getInt at input + 1
             // on this little-endian-only library)
             long currentLong = UNSAFE.getLong(inputBase, input);
 
-            int shortHash = hash(inputBase, input, shortHashBits, matchSearchLength);
+            int shortHash = intShortHash
+                    ? ((int) currentLong * PRIME_4_BYTES) >>> intHashRightShift
+                    : (int) (((currentLong << shortHashLeftShift) * shortHashPrime) >>> shortHashRightShift);
             long shortMatchAddress = baseAddress + shortHashTable[shortHash];
 
             int longHash = hash8(currentLong, longHashBits);
@@ -143,6 +175,17 @@ class DoubleFastBlockCompressor
             int[] longHashTable, int longHashBits, int[] shortHashTable, int shortHashBits, int matchSearchLength,
             SequenceStore output, long[] cursor)
     {
+        // ARM/ART: SequenceStore internals hoisted ONCE per sequence; the inlined appends below do
+        // no reference-field loads (each carries a GC read barrier on ART) and no calls. This is
+        // the round-3 idea applied at the correct layer: in the outlined per-sequence method,
+        // not the per-position scan loop (where the extra live values caused spills).
+        final byte[] literalsBuffer = output.literalsBuffer;
+        final int[] seqLiteralLengths = output.literalLengths;
+        final int[] seqOffsets = output.offsets;
+        final int[] seqMatchLengths = output.matchLengths;
+        int literalsLength = output.literalsLength;
+        int sequenceCount = output.sequenceCount;
+
         int matchLength;
         int offset;
 
@@ -150,7 +193,34 @@ class DoubleFastBlockCompressor
             // found a repeated sequence of at least 4 bytes, separated by offset1
             matchLength = count(inputBase, input + 1 + SIZE_OF_INT, inputEnd, input + 1 + SIZE_OF_INT - offset1) + SIZE_OF_INT;
             input++;
-            output.storeSequence(inputBase, anchor, (int) (input - anchor), 0, matchLength - MIN_MATCH);
+            {
+                // inlined SequenceStore.storeSequence (same stores, same order)
+                int literalLen = (int) (input - anchor);
+                long copySource = anchor;
+                long copyTarget = ARRAY_BYTE_BASE_OFFSET + literalsLength;
+                int copied = 0;
+                do {
+                    UNSAFE.putLong(literalsBuffer, copyTarget, UNSAFE.getLong(inputBase, copySource));
+                    copySource += SIZE_OF_LONG;
+                    copyTarget += SIZE_OF_LONG;
+                    copied += SIZE_OF_LONG;
+                }
+                while (copied < literalLen);
+                literalsLength += literalLen;
+                if (literalLen > 65535) {
+                    output.longLengthField = SequenceStore.LongField.LITERAL;
+                    output.longLengthPosition = sequenceCount;
+                }
+                seqLiteralLengths[sequenceCount] = literalLen;
+                seqOffsets[sequenceCount] = 0 + 1;
+                int matchLengthBase = matchLength - MIN_MATCH;
+                if (matchLengthBase > 65535) {
+                    output.longLengthField = SequenceStore.LongField.MATCH;
+                    output.longLengthPosition = sequenceCount;
+                }
+                seqMatchLengths[sequenceCount] = matchLengthBase;
+                sequenceCount++;
+            }
         }
         else {
             if (matchKind == MATCH_KIND_LONG) {
@@ -195,7 +265,34 @@ class DoubleFastBlockCompressor
             offset2 = offset1;
             offset1 = offset;
 
-            output.storeSequence(inputBase, anchor, (int) (input - anchor), offset + REP_MOVE, matchLength - MIN_MATCH);
+            {
+                // inlined SequenceStore.storeSequence (same stores, same order)
+                int literalLen = (int) (input - anchor);
+                long copySource = anchor;
+                long copyTarget = ARRAY_BYTE_BASE_OFFSET + literalsLength;
+                int copied = 0;
+                do {
+                    UNSAFE.putLong(literalsBuffer, copyTarget, UNSAFE.getLong(inputBase, copySource));
+                    copySource += SIZE_OF_LONG;
+                    copyTarget += SIZE_OF_LONG;
+                    copied += SIZE_OF_LONG;
+                }
+                while (copied < literalLen);
+                literalsLength += literalLen;
+                if (literalLen > 65535) {
+                    output.longLengthField = SequenceStore.LongField.LITERAL;
+                    output.longLengthPosition = sequenceCount;
+                }
+                seqLiteralLengths[sequenceCount] = literalLen;
+                seqOffsets[sequenceCount] = offset + REP_MOVE + 1;
+                int matchLengthBase = matchLength - MIN_MATCH;
+                if (matchLengthBase > 65535) {
+                    output.longLengthField = SequenceStore.LongField.MATCH;
+                    output.longLengthPosition = sequenceCount;
+                }
+                seqMatchLengths[sequenceCount] = matchLengthBase;
+                sequenceCount++;
+            }
         }
 
         input += matchLength;
@@ -220,12 +317,42 @@ class DoubleFastBlockCompressor
                 shortHashTable[hash(inputBase, input, shortHashBits, matchSearchLength)] = (int) (input - baseAddress);
                 longHashTable[hash8(UNSAFE.getLong(inputBase, input), longHashBits)] = (int) (input - baseAddress);
 
-                output.storeSequence(inputBase, anchor, 0, 0, repetitionLength - MIN_MATCH);
+                {
+                    // inlined SequenceStore.storeSequence (same stores, same order)
+                    int literalLen = 0;
+                    long copySource = anchor;
+                    long copyTarget = ARRAY_BYTE_BASE_OFFSET + literalsLength;
+                    int copied = 0;
+                    do {
+                        UNSAFE.putLong(literalsBuffer, copyTarget, UNSAFE.getLong(inputBase, copySource));
+                        copySource += SIZE_OF_LONG;
+                        copyTarget += SIZE_OF_LONG;
+                        copied += SIZE_OF_LONG;
+                    }
+                    while (copied < literalLen);
+                    literalsLength += literalLen;
+                    if (literalLen > 65535) {
+                        output.longLengthField = SequenceStore.LongField.LITERAL;
+                        output.longLengthPosition = sequenceCount;
+                    }
+                    seqLiteralLengths[sequenceCount] = literalLen;
+                    seqOffsets[sequenceCount] = 0 + 1;
+                    int matchLengthBase = repetitionLength - MIN_MATCH;
+                    if (matchLengthBase > 65535) {
+                        output.longLengthField = SequenceStore.LongField.MATCH;
+                        output.longLengthPosition = sequenceCount;
+                    }
+                    seqMatchLengths[sequenceCount] = matchLengthBase;
+                    sequenceCount++;
+                }
 
                 input += repetitionLength;
                 anchor = input;
             }
         }
+
+        output.literalsLength = literalsLength;
+        output.sequenceCount = sequenceCount;
 
         cursor[CURSOR_INPUT] = input;
         cursor[CURSOR_ANCHOR] = anchor;
