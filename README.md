@@ -12,7 +12,7 @@ members the library relied on are replaced with portable equivalents, and
 Android's own heap/native memcpy primitives are used when available (resolved
 once, with a pure-Java fallback).
 
-The Android support is a POC, won't be nearly as performant as zstd-jni AAR libraries,
+The Android support is a POC, won't quite match the performance of zstd-jni AAR libraries,
 but is still way more performant than other integrated algorithms such as gzip;
 do not benchmark on debug builds, performance will suffer greatly.
 
@@ -33,7 +33,7 @@ allprojects {
 Then add the dependency:
 
 ```gradle
-    implementation 'com.github.alesimula:murine-aircompressor:2.0.7'
+    implementation 'com.github.alesimula:murine-aircompressor:2.0.9'
 ```
 
 **Using Maven**
@@ -51,7 +51,7 @@ Then add the dependency:
 <dependency>
     <groupId>com.github.alesimula</groupId>
     <artifactId>murine-aircompressor</artifactId>
-    <version>2.0.7</version>
+    <version>2.0.9</version>
 </dependency>
 ```
 
@@ -129,9 +129,7 @@ The implementation is provided by the `ZstdCompressor` and `ZstdDecompressor`
 classes. The Zstandard streaming format is supported by `ZstdInputStream` and
 `ZstdOutputStream`.
 
-The compression level can be selected through the `ZstdCompressor(int)` and
-`ZstdOutputStream(OutputStream, int)` constructors. Following zstd's own
-convention, level 0 is an alias for the default level (3).
+The compression level can be selected, although it's recommended to leave the default level 3.
 
 Note that the Java implementation only includes the `DFAST`
 strategy: the streaming compressor supports levels 3 (default, recommended) 
@@ -139,6 +137,10 @@ and 4 (not recommended, nearly identical but slower); higher
 strategies (`GREEDY` through `BTULTRA`) are not implemented and are rejected
 at construction. Decompression is strategy-agnostic and handles frames
 produced at any level by any zstd implementation.
+
+Parallel compression can be enabled via the `parallel(workers)` and `parallel(workers, chunkSize)`
+methods on the stream, distributing the workload across multiple threads to maximize throughput
+on multi-core devices.
 
 The algorithm allows passing WindowSlideMode.HIGH_COMPRESSION (default) for more
 compression at the cost of performance, or WindowSlideMode.HIGH_SPEED for a more performant

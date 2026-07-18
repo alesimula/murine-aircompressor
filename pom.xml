@@ -11,7 +11,7 @@
 
     <groupId>io.airlift</groupId>
     <artifactId>aircompressor</artifactId>
-    <version>2.0.5</version>
+    <version>2.0.9</version>
     <packaging>jar</packaging>
 
     <name>aircompressor</name>
@@ -30,11 +30,11 @@
     </licenses>
 
     <scm>
-        <connection>scm:git:git://github.com/airlift/aircompressor.git</connection>
-        <developerConnection>scm:git:git@github.com:airlift/aircompressor.git</developerConnection>
-        <url>https://github.com/airlift/aircompressor/tree/release-2.x</url>
-        <tag>2.0.3</tag>
-  </scm>
+        <connection>scm:git:git://github.com/alesimula/murine-aircompressor.git</connection>
+        <developerConnection>scm:git:git@github.com:alesimula/murine-aircompressor.git</developerConnection>
+        <url>https://github.com/alesimula/murine-aircompressor</url>
+        <tag>HEAD</tag>
+    </scm>
 
     <properties>
         <air.java.version>1.8</air.java.version>
