@@ -42,6 +42,8 @@ public class ZstdOutputStream
     private final OutputStream outputStream;
     private final CompressionContext context;
     private final WindowSlideMode windowSlideMode;
+    private final BufferMode bufferMode; // Only here to pass to parallel constructor
+    private final int compressionLevel; // Only here to pass to parallel constructor
     private final boolean ringMode;
     private final byte[] compressed;
     private final int windowSize;
@@ -115,7 +117,9 @@ public class ZstdOutputStream
     {
         this.outputStream = requireNonNull(outputStream, "outputStream is null");
         this.windowSlideMode = requireNonNull(windowSlideMode, "windowSlideMode is null");
-        this.ringMode = requireNonNull(bufferMode, "bufferMode is null") == BufferMode.RING_BUFFER;
+        this.compressionLevel = compressionLevel;
+        this.bufferMode = requireNonNull(bufferMode, "bufferMode is null");
+        this.ringMode = bufferMode == BufferMode.RING_BUFFER;
         CompressionParameters parameters = CompressionParameters.compute(compressionLevel, -1);
         CompressionParameters.checkLevelSupported(parameters, compressionLevel);
         this.context = new CompressionContext(parameters, ARRAY_BYTE_BASE_OFFSET, Integer.MAX_VALUE);
@@ -138,6 +142,37 @@ public class ZstdOutputStream
             this.maxBufferSize = windowSize * 4;
             this.ring = null;
         }
+    }
+
+    /**
+     * Returns a stream that compresses with this stream's settings (level, window-slide mode)
+     * across {@code workerThreads} parallel workers, writing independent zstd frames in order to
+     * the same underlying stream.
+     * May ever so slightly affect compression ratio, this is mostly negligible, but can be
+     * mitigated by passing a bigger chunk with the {@link #parallel(int, int)} method.
+     *
+     * <p>Must be called before anything is written. This instance is consumed by the call
+     * (further writes throw, {@code close()} becomes a no-op) - use only the returned stream.
+     */
+    public OutputStream parallel(int workerThreads)
+            throws IOException
+    {
+        return parallel(workerThreads, ZstdParallelOutputStream.DEFAULT_CHUNK_SIZE);
+    }
+
+    /**
+     * @param chunkSize bytes per independent frame; larger chunks = marginally better ratio,
+     *                  more memory in flight
+     * @see #parallel(int)
+     */
+    public OutputStream parallel(int workerThreads, int chunkSize)
+            throws IOException
+    {
+        checkState(!ringHeaderWritten && ringPosition == 0 && partialHash == null && uncompressedPosition == 0,
+                "parallel() must be called before writing any data");
+        checkState(!closed, "Stream is closed");
+        closed = true; // consume this instance; the returned stream owns the underlying output
+        return new ZstdParallelOutputStream(outputStream, compressionLevel, windowSlideMode, bufferMode, workerThreads, chunkSize);
     }
 
     @Override
