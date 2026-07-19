@@ -107,6 +107,12 @@ final class HuffmanCompressionTable
     {
         // populate the leaves of the node table from the histogram of counts
         // in descending order by count, ascending by symbol value.
+        // Insertion sort, once per block. copyNode() shifted all four node arrays, but parents
+        // and numberOfBits are still zero at this point - half the copying did nothing. Locals
+        // for the other two also avoid a read barrier per access on ART. Same sort order out.
+        int[] nodeCounts = nodeTable.count;
+        int[] nodeSymbols = nodeTable.symbols;
+
         short current = 0;
 
         for (int symbol = 0; symbol <= maxSymbol; symbol++) {
@@ -114,13 +120,14 @@ final class HuffmanCompressionTable
 
             // simple insertion sort
             int position = current;
-            while (position > 1 && count > nodeTable.count[position - 1]) {
-                nodeTable.copyNode(position - 1, position);
+            while (position > 1 && count > nodeCounts[position - 1]) {
+                nodeCounts[position] = nodeCounts[position - 1];
+                nodeSymbols[position] = nodeSymbols[position - 1];
                 position--;
             }
 
-            nodeTable.count[position] = count;
-            nodeTable.symbols[position] = symbol;
+            nodeCounts[position] = count;
+            nodeSymbols[position] = symbol;
 
             current++;
         }
