@@ -129,11 +129,12 @@ The implementation is provided by the `ZstdCompressor` and `ZstdDecompressor`
 classes. The Zstandard streaming format is supported by `ZstdInputStream` and
 `ZstdOutputStream`.
 
-The compression level can be selected, although it's recommended to leave the default level 3.
+The compression level can be selected, although it's recommended to leave the default level 3
+or use 2 for faster compression.
 
-Note that the Java implementation only includes the `DFAST`
-strategy: the streaming compressor supports levels 3 (default, recommended) 
-and 4 (not recommended, nearly identical but slower); higher 
+Note that the Java implementation only includes the `FAST` and `DFAST`
+strategies: the streaming compressor supports levels 1, 2 (good and fast), 3 (default) 
+and 4 (not recommended, nearly identical to 3 but slower); higher 
 strategies (`GREEDY` through `BTULTRA`) are not implemented and are rejected
 at construction. Decompression is strategy-agnostic and handles frames
 produced at any level by any zstd implementation.

@@ -148,7 +148,7 @@ class CompressionParameters
         // from faster to stronger
 
         // YC: fast is a "single probe" strategy : at every position, we attempt to find a match, and give up if we don't find any. similar to lz4.
-        FAST(BlockCompressor.UNSUPPORTED),
+        FAST(new FastBlockCompressor()),
 
         // YC: double_fast is a 2 attempts strategies. They are not symmetrical by the way. One attempt is "normal" while the second one looks for "long matches". It was
         // empirically found that this was the best trade off. As can be guessed, it's slower than single-attempt, but find more and better matches, so compresses better.
@@ -261,7 +261,7 @@ class CompressionParameters
             throw new IllegalArgumentException("Compression level " + compressionLevel
                     + " requires strategy " + parameters.getStrategy()
                     + ", which is not implemented by the Java Zstd compressor"
-                    + " (supported: 3 (the default; level 0 is zstd's alias for default) and 4 for streaming)");
+                    + " (supported: 1-2 (FAST) and 3-4 (DFAST; 3 is the default, level 0 is zstd's alias for it))");
         }
     }
 
