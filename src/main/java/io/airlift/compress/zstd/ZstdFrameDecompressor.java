@@ -397,13 +397,34 @@ class ZstdFrameDecompressor
             while (sequenceCount > 0) {
                 sequenceCount--;
 
-                int loaded = BitInputStream.loadBits(inputBase, input, currentAddress, bits, bitsConsumed, scratch);
-                bits = scratch[0];
-                currentAddress = scratch[1];
-                bitsConsumed = loaded & BitInputStream.LOAD_BITS_CONSUMED_MASK;
-                if ((loaded & BitInputStream.LOAD_OVERFLOW) != 0) {
+                // ARM/ART: BitInputStream.loadBits inlined here - removes a call and the long[]
+                // scratch round-trip per sequence, so bits/currentAddress/bitsConsumed stay in
+                // registers. Logic is identical to loadBits; LOAD_DONE was never read by this
+                // caller, and the overflow case breaks out before any state is used.
+                if (bitsConsumed > 64) {
                     verify(sequenceCount == 0, input, "Not all sequences were consumed");
                     break;
+                }
+                if (currentAddress != input) {
+                    int refillBytes = bitsConsumed >>> 3;
+                    if (currentAddress >= input + SIZE_OF_LONG) {
+                        if (refillBytes > 0) {
+                            currentAddress -= refillBytes;
+                            bits = UNSAFE.getLong(inputBase, currentAddress);
+                        }
+                        bitsConsumed &= 0b111;
+                    }
+                    else if (currentAddress - refillBytes < input) {
+                        refillBytes = (int) (currentAddress - input);
+                        currentAddress = input;
+                        bitsConsumed -= refillBytes * SIZE_OF_LONG;
+                        bits = UNSAFE.getLong(inputBase, input);
+                    }
+                    else {
+                        currentAddress -= refillBytes;
+                        bitsConsumed -= refillBytes * SIZE_OF_LONG;
+                        bits = UNSAFE.getLong(inputBase, currentAddress);
+                    }
                 }
 
                 // decode sequence
@@ -470,11 +491,29 @@ class ZstdFrameDecompressor
                 }
 
                 int totalBits = literalsLengthBits + matchLengthBits + offsetBits;
-                if (totalBits > 64 - 7 - (LITERAL_LENGTH_TABLE_LOG + MATCH_LENGTH_TABLE_LOG + OFFSET_TABLE_LOG)) {
-                    int reloaded = BitInputStream.loadBits(inputBase, input, currentAddress, bits, bitsConsumed, scratch);
-                    bits = scratch[0];
-                    currentAddress = scratch[1];
-                    bitsConsumed = reloaded & BitInputStream.LOAD_BITS_CONSUMED_MASK;
+                if (totalBits > 64 - 7 - (LITERAL_LENGTH_TABLE_LOG + MATCH_LENGTH_TABLE_LOG + OFFSET_TABLE_LOG)
+                        && bitsConsumed <= 64 && currentAddress != input) {
+                    // loadBits inlined (see above). Overflow / at-start both leave state untouched,
+                    // which is exactly what the guard conditions above express.
+                    int refillBytes = bitsConsumed >>> 3;
+                    if (currentAddress >= input + SIZE_OF_LONG) {
+                        if (refillBytes > 0) {
+                            currentAddress -= refillBytes;
+                            bits = UNSAFE.getLong(inputBase, currentAddress);
+                        }
+                        bitsConsumed &= 0b111;
+                    }
+                    else if (currentAddress - refillBytes < input) {
+                        refillBytes = (int) (currentAddress - input);
+                        currentAddress = input;
+                        bitsConsumed -= refillBytes * SIZE_OF_LONG;
+                        bits = UNSAFE.getLong(inputBase, input);
+                    }
+                    else {
+                        currentAddress -= refillBytes;
+                        bitsConsumed -= refillBytes * SIZE_OF_LONG;
+                        bits = UNSAFE.getLong(inputBase, currentAddress);
+                    }
                 }
 
                 int numberOfBits;
@@ -508,7 +547,9 @@ class ZstdFrameDecompressor
                     // copy literals. literalOutputLimit <= fastOutputLimit, so we can copy
                     // long at a time with over-copy
                     output = copyLiterals(outputBase, literalsBase, output, literalsInput, literalOutputLimit);
-                    copyMatch(outputBase, fastOutputLimit, output, offset, matchOutputLimit, matchAddress, matchLength, fastMatchOutputLimit);
+                    // copyMatch was a pure pass-through around these two - one call layer deleted
+                    long tailAddress = copyMatchHead(outputBase, output, offset, matchAddress);
+                    copyMatchTail(outputBase, fastOutputLimit, output + SIZE_OF_LONG, matchOutputLimit, tailAddress, matchLength - SIZE_OF_LONG, fastMatchOutputLimit);
                 }
                 output = matchOutputLimit;
                 literalsInput = literalEnd;
@@ -528,22 +569,6 @@ class ZstdFrameDecompressor
         copyMemory(literalsBase, literalsInput, outputBase, output, lastLiteralsSize);
         output += lastLiteralsSize;
         return output;
-    }
-
-    private static void copyMatch(Object outputBase,
-            long fastOutputLimit,
-            long output,
-            int offset,
-            long matchOutputLimit,
-            long matchAddress,
-            int matchLength,
-            long fastMatchOutputLimit)
-    {
-        matchAddress = copyMatchHead(outputBase, output, offset, matchAddress);
-        output += SIZE_OF_LONG;
-        matchLength -= SIZE_OF_LONG; // first 8 bytes copied above
-
-        copyMatchTail(outputBase, fastOutputLimit, output, matchOutputLimit, matchAddress, matchLength, fastMatchOutputLimit);
     }
 
     private static void copyMatchTail(Object outputBase, long fastOutputLimit, long output, long matchOutputLimit, long matchAddress, int matchLength, long fastMatchOutputLimit)
