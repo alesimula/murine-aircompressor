@@ -150,10 +150,26 @@ class Huffman
                 break;
             }
 
-            bitsConsumed = decodeSymbol(outputBase, output, bits, bitsConsumed, tableLog, numbersOfBits, symbols);
-            bitsConsumed = decodeSymbol(outputBase, output + 1, bits, bitsConsumed, tableLog, numbersOfBits, symbols);
-            bitsConsumed = decodeSymbol(outputBase, output + 2, bits, bitsConsumed, tableLog, numbersOfBits, symbols);
-            bitsConsumed = decodeSymbol(outputBase, output + 3, bits, bitsConsumed, tableLog, numbersOfBits, symbols);
+            {
+                int index = (int) peekBitsFast(bitsConsumed, bits, tableLog);
+                UNSAFE.putByte(outputBase, output, symbols[index]);
+                bitsConsumed += numbersOfBits[index];
+            }
+            {
+                int index = (int) peekBitsFast(bitsConsumed, bits, tableLog);
+                UNSAFE.putByte(outputBase, output + 1, symbols[index]);
+                bitsConsumed += numbersOfBits[index];
+            }
+            {
+                int index = (int) peekBitsFast(bitsConsumed, bits, tableLog);
+                UNSAFE.putByte(outputBase, output + 2, symbols[index]);
+                bitsConsumed += numbersOfBits[index];
+            }
+            {
+                int index = (int) peekBitsFast(bitsConsumed, bits, tableLog);
+                UNSAFE.putByte(outputBase, output + 3, symbols[index]);
+                bitsConsumed += numbersOfBits[index];
+            }
             output += SIZE_OF_INT;
         }
 
@@ -199,31 +215,96 @@ class Huffman
         long output3 = outputStart3;
         long output4 = outputStart4;
 
+        // decodeSymbol() is inlined at every call site below: it was one call per decoded byte.
         long fastOutputLimit = outputLimit - 7;
         int tableLog = this.tableLog;
         byte[] numbersOfBits = this.numbersOfBits;
         byte[] symbols = this.symbols;
 
         while (output4 < fastOutputLimit) {
-            stream1bitsConsumed = decodeSymbol(outputBase, output1, stream1bits, stream1bitsConsumed, tableLog, numbersOfBits, symbols);
-            stream2bitsConsumed = decodeSymbol(outputBase, output2, stream2bits, stream2bitsConsumed, tableLog, numbersOfBits, symbols);
-            stream3bitsConsumed = decodeSymbol(outputBase, output3, stream3bits, stream3bitsConsumed, tableLog, numbersOfBits, symbols);
-            stream4bitsConsumed = decodeSymbol(outputBase, output4, stream4bits, stream4bitsConsumed, tableLog, numbersOfBits, symbols);
+            {
+                int index = (int) peekBitsFast(stream1bitsConsumed, stream1bits, tableLog);
+                UNSAFE.putByte(outputBase, output1, symbols[index]);
+                stream1bitsConsumed += numbersOfBits[index];
+            }
+            {
+                int index = (int) peekBitsFast(stream2bitsConsumed, stream2bits, tableLog);
+                UNSAFE.putByte(outputBase, output2, symbols[index]);
+                stream2bitsConsumed += numbersOfBits[index];
+            }
+            {
+                int index = (int) peekBitsFast(stream3bitsConsumed, stream3bits, tableLog);
+                UNSAFE.putByte(outputBase, output3, symbols[index]);
+                stream3bitsConsumed += numbersOfBits[index];
+            }
+            {
+                int index = (int) peekBitsFast(stream4bitsConsumed, stream4bits, tableLog);
+                UNSAFE.putByte(outputBase, output4, symbols[index]);
+                stream4bitsConsumed += numbersOfBits[index];
+            }
 
-            stream1bitsConsumed = decodeSymbol(outputBase, output1 + 1, stream1bits, stream1bitsConsumed, tableLog, numbersOfBits, symbols);
-            stream2bitsConsumed = decodeSymbol(outputBase, output2 + 1, stream2bits, stream2bitsConsumed, tableLog, numbersOfBits, symbols);
-            stream3bitsConsumed = decodeSymbol(outputBase, output3 + 1, stream3bits, stream3bitsConsumed, tableLog, numbersOfBits, symbols);
-            stream4bitsConsumed = decodeSymbol(outputBase, output4 + 1, stream4bits, stream4bitsConsumed, tableLog, numbersOfBits, symbols);
+            {
+                int index = (int) peekBitsFast(stream1bitsConsumed, stream1bits, tableLog);
+                UNSAFE.putByte(outputBase, output1 + 1, symbols[index]);
+                stream1bitsConsumed += numbersOfBits[index];
+            }
+            {
+                int index = (int) peekBitsFast(stream2bitsConsumed, stream2bits, tableLog);
+                UNSAFE.putByte(outputBase, output2 + 1, symbols[index]);
+                stream2bitsConsumed += numbersOfBits[index];
+            }
+            {
+                int index = (int) peekBitsFast(stream3bitsConsumed, stream3bits, tableLog);
+                UNSAFE.putByte(outputBase, output3 + 1, symbols[index]);
+                stream3bitsConsumed += numbersOfBits[index];
+            }
+            {
+                int index = (int) peekBitsFast(stream4bitsConsumed, stream4bits, tableLog);
+                UNSAFE.putByte(outputBase, output4 + 1, symbols[index]);
+                stream4bitsConsumed += numbersOfBits[index];
+            }
 
-            stream1bitsConsumed = decodeSymbol(outputBase, output1 + 2, stream1bits, stream1bitsConsumed, tableLog, numbersOfBits, symbols);
-            stream2bitsConsumed = decodeSymbol(outputBase, output2 + 2, stream2bits, stream2bitsConsumed, tableLog, numbersOfBits, symbols);
-            stream3bitsConsumed = decodeSymbol(outputBase, output3 + 2, stream3bits, stream3bitsConsumed, tableLog, numbersOfBits, symbols);
-            stream4bitsConsumed = decodeSymbol(outputBase, output4 + 2, stream4bits, stream4bitsConsumed, tableLog, numbersOfBits, symbols);
+            {
+                int index = (int) peekBitsFast(stream1bitsConsumed, stream1bits, tableLog);
+                UNSAFE.putByte(outputBase, output1 + 2, symbols[index]);
+                stream1bitsConsumed += numbersOfBits[index];
+            }
+            {
+                int index = (int) peekBitsFast(stream2bitsConsumed, stream2bits, tableLog);
+                UNSAFE.putByte(outputBase, output2 + 2, symbols[index]);
+                stream2bitsConsumed += numbersOfBits[index];
+            }
+            {
+                int index = (int) peekBitsFast(stream3bitsConsumed, stream3bits, tableLog);
+                UNSAFE.putByte(outputBase, output3 + 2, symbols[index]);
+                stream3bitsConsumed += numbersOfBits[index];
+            }
+            {
+                int index = (int) peekBitsFast(stream4bitsConsumed, stream4bits, tableLog);
+                UNSAFE.putByte(outputBase, output4 + 2, symbols[index]);
+                stream4bitsConsumed += numbersOfBits[index];
+            }
 
-            stream1bitsConsumed = decodeSymbol(outputBase, output1 + 3, stream1bits, stream1bitsConsumed, tableLog, numbersOfBits, symbols);
-            stream2bitsConsumed = decodeSymbol(outputBase, output2 + 3, stream2bits, stream2bitsConsumed, tableLog, numbersOfBits, symbols);
-            stream3bitsConsumed = decodeSymbol(outputBase, output3 + 3, stream3bits, stream3bitsConsumed, tableLog, numbersOfBits, symbols);
-            stream4bitsConsumed = decodeSymbol(outputBase, output4 + 3, stream4bits, stream4bitsConsumed, tableLog, numbersOfBits, symbols);
+            {
+                int index = (int) peekBitsFast(stream1bitsConsumed, stream1bits, tableLog);
+                UNSAFE.putByte(outputBase, output1 + 3, symbols[index]);
+                stream1bitsConsumed += numbersOfBits[index];
+            }
+            {
+                int index = (int) peekBitsFast(stream2bitsConsumed, stream2bits, tableLog);
+                UNSAFE.putByte(outputBase, output2 + 3, symbols[index]);
+                stream2bitsConsumed += numbersOfBits[index];
+            }
+            {
+                int index = (int) peekBitsFast(stream3bitsConsumed, stream3bits, tableLog);
+                UNSAFE.putByte(outputBase, output3 + 3, symbols[index]);
+                stream3bitsConsumed += numbersOfBits[index];
+            }
+            {
+                int index = (int) peekBitsFast(stream4bitsConsumed, stream4bits, tableLog);
+                UNSAFE.putByte(outputBase, output4 + 3, symbols[index]);
+                stream4bitsConsumed += numbersOfBits[index];
+            }
 
             output1 += SIZE_OF_INT;
             output2 += SIZE_OF_INT;
@@ -289,21 +370,30 @@ class Huffman
                 break;
             }
 
-            bitsConsumed = decodeSymbol(outputBase, outputAddress++, bits, bitsConsumed, tableLog, numbersOfBits, symbols);
+            {
+                int index = (int) peekBitsFast(bitsConsumed, bits, tableLog);
+                UNSAFE.putByte(outputBase, outputAddress++, symbols[index]);
+                bitsConsumed += numbersOfBits[index];
+            }
         }
 
         // not more data in bit stream, so no need to reload
         while (outputAddress < outputLimit) {
-            bitsConsumed = decodeSymbol(outputBase, outputAddress++, bits, bitsConsumed, tableLog, numbersOfBits, symbols);
+            {
+                int index = (int) peekBitsFast(bitsConsumed, bits, tableLog);
+                UNSAFE.putByte(outputBase, outputAddress++, symbols[index]);
+                bitsConsumed += numbersOfBits[index];
+            }
         }
 
         verify(isEndOfStream(startAddress, currentAddress, bitsConsumed), startAddress, "Bit stream is not fully consumed");
     }
 
-    private static int decodeSymbol(Object outputBase, long outputAddress, long bitContainer, int bitsConsumed, int tableLog, byte[] numbersOfBits, byte[] symbols)
-    {
-        int value = (int) peekBitsFast(bitsConsumed, bitContainer, tableLog);
-        UNSAFE.putByte(outputBase, outputAddress, symbols[value]);
-        return bitsConsumed + numbersOfBits[value];
-    }
+    // NOW REPLACED WITH INLINED CODE
+    //private static int decodeSymbol(Object outputBase, long outputAddress, long bitContainer, int bitsConsumed, int tableLog, byte[] numbersOfBits, byte[] symbols)
+    //{
+    //    int value = (int) peekBitsFast(bitsConsumed, bitContainer, tableLog);
+    //    UNSAFE.putByte(outputBase, outputAddress, symbols[value]);
+    //    return bitsConsumed + numbersOfBits[value];
+    //}
 }
