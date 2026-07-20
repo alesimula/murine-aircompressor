@@ -171,6 +171,9 @@ public class ZstdOutputStream
         checkState(!ringHeaderWritten && ringPosition == 0 && partialHash == null && uncompressedPosition == 0,
                 "parallel() must be called before writing any data");
         checkState(!closed, "Stream is closed");
+        if (workerThreads <= 1) {
+            return this;
+        }
         closed = true; // consume this instance; the returned stream owns the underlying output
         return new ZstdParallelOutputStream(outputStream, compressionLevel, windowSlideMode, bufferMode, workerThreads, chunkSize);
     }
