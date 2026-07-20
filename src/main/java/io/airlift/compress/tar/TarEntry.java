@@ -18,7 +18,7 @@ import java.math.BigInteger;
 import java.nio.file.Path;
 import java.util.Arrays;
 
-import static java.nio.charset.StandardCharsets.US_ASCII;
+import static java.nio.charset.StandardCharsets.UTF_8;
 
 /**
  * A single entry of a USTAR (POSIX.1-1988) archive. Knows how to read and
@@ -84,7 +84,7 @@ public class TarEntry
     {
         Arrays.fill(block, (byte) 0);
         String suffix = name;
-        if (suffix.length() > 100) {
+        if (utf8Length(suffix) > 100) {
             // ustar name split: prefix field holds the leading directories
             int slash = splitPoint(name);
             if (slash < 0) {
@@ -189,7 +189,30 @@ public class TarEntry
      */
     boolean fitsUstar()
     {
-        return size <= MAX_OCTAL && (name.getBytes(US_ASCII).length <= 100 || splitPoint(name) >= 0);
+        return size <= MAX_OCTAL && nameFitsUstar();
+    }
+
+    /**
+     * True when the name fits the ustar name field, on its own or split across the prefix field.
+     */
+    boolean nameFitsUstar()
+    {
+        return utf8Length(name) <= 100 || splitPoint(name) >= 0;
+    }
+
+    /**
+     * True when the name is plain 7-bit ASCII, and so needs no encoding declared for it. ustar
+     * leaves the character set of its fields unspecified, so a non-ASCII name is only unambiguous
+     * when it is also carried in a PAX record, which POSIX.1-2001 defines as UTF-8.
+     */
+    boolean hasAsciiName()
+    {
+        for (int i = 0; i < name.length(); i++) {
+            if (name.charAt(i) > 0x7F) {
+                return false;
+            }
+        }
+        return true;
     }
 
     TarEntry setType(char type)
@@ -208,11 +231,34 @@ public class TarEntry
     private static int splitPoint(String name)
     {
         for (int i = name.indexOf('/'); i >= 0; i = name.indexOf('/', i + 1)) {
-            if (i <= 155 && name.length() - i - 1 <= 100) {
+            if (utf8Length(name.substring(0, i)) <= 155 && utf8Length(name.substring(i + 1)) <= 100) {
                 return i;
             }
         }
         return -1;
+    }
+
+    // the header fields are sized in bytes, and a non-ASCII character takes several of them
+    static int utf8Length(String value)
+    {
+        return value.getBytes(UTF_8).length;
+    }
+
+    /**
+     * Truncates to at most {@code maxBytes} of UTF-8, without splitting a character in half.
+     */
+    static String truncateUtf8(String value, int maxBytes)
+    {
+        byte[] bytes = value.getBytes(UTF_8);
+        if (bytes.length <= maxBytes) {
+            return value;
+        }
+        // back off over the continuation bytes of a character the cut landed inside
+        int end = maxBytes;
+        while (end > 0 && (bytes[end] & 0xC0) == 0x80) {
+            end--;
+        }
+        return new String(bytes, 0, end, UTF_8);
     }
 
     private static long checksum(byte[] header, boolean signed)
@@ -313,7 +359,7 @@ public class TarEntry
         while (end < offset + length && block[end] != 0) {
             end++;
         }
-        return new String(block, offset, end - offset, US_ASCII);
+        return new String(block, offset, end - offset, UTF_8);
     }
 
     private static void writeOctal(byte[] block, int offset, int length, long value)
@@ -327,7 +373,7 @@ public class TarEntry
 
     private static void writeString(byte[] block, int offset, int length, String value)
     {
-        byte[] bytes = value.getBytes(US_ASCII);
+        byte[] bytes = value.getBytes(UTF_8);
         if (bytes.length > length) {
             throw new IllegalArgumentException("Value too long for tar field: " + value);
         }

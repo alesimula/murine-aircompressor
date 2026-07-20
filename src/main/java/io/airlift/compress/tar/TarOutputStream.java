@@ -34,10 +34,27 @@ public class TarOutputStream
     private int padding;
     private boolean entryOpen;
     private boolean finished;
+    private boolean unicodeNames = true;
 
     public TarOutputStream(OutputStream out)
     {
         super(out);
+    }
+
+    /**
+     * Whether names that are not plain ASCII are declared as UTF-8 through a PAX record:
+     * on by default. ustar does not state what character set its name fields hold, so such a name is only
+     * unambiguous when it is also carried in a PAX record, which POSIX.1-2001 defines as UTF-8.
+     *
+     * @throws IllegalStateException if the archive is already being written
+     */
+    public TarOutputStream setUnicodeNames(boolean unicodeNames)
+    {
+        if (entryOpen || finished) {
+            throw new IllegalStateException("Archive is already being written");
+        }
+        this.unicodeNames = unicodeNames;
+        return this;
     }
 
     public void putNextEntry(TarEntry entry)
@@ -50,13 +67,16 @@ public class TarOutputStream
             throw new IOException("Archive is finished");
         }
         TarEntry header = entry;
-        if (!entry.fitsUstar()) {
-            // PAX (POSIX.1-2001): a preceding 'x' entry carries the values that don't fit the ustar fields;
-            // the real header holds truncated fallbacks
+        if (!entry.fitsUstar() || (unicodeNames && !entry.hasAsciiName())) {
+            // PAX (POSIX.1-2001): a preceding 'x' entry carries the values that don't fit the ustar
+            // fields, or that need UTF-8 stated for them; the real header holds the fallbacks
             writePaxHeader(entry);
-            String shortName = entry.getName().substring(0, Math.min(entry.getName().length(), 100));
-            if (entry.isDirectory() && !shortName.endsWith("/")) {
-                shortName = shortName.substring(0, 99) + "/";
+            String shortName = entry.getName();
+            if (!entry.nameFitsUstar()) {
+                shortName = TarEntry.truncateUtf8(shortName, 100);
+                if (entry.isDirectory() && !shortName.endsWith("/")) {
+                    shortName = TarEntry.truncateUtf8(shortName, 99) + "/";
+                }
             }
             header = new TarEntry(shortName, entry.getSize(), entry.getMode()).setModTime(entry.getModTime());
         }
