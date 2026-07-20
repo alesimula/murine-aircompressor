@@ -32,8 +32,6 @@ class FastBlockCompressor
     private static final int CURSOR_OFFSET_1 = 2;
     private static final int CURSOR_OFFSET_2 = 3;
 
-    private final long[] cursor = new long[4];
-
     public int compressBlock(Object inputBase, final long inputAddress, int inputSize, SequenceStore output, BlockCompressionState state, RepeatedOffsets offsets, CompressionParameters parameters)
     {
         int matchSearchLength = Math.max(parameters.getSearchLength(), 4);
@@ -93,7 +91,7 @@ class FastBlockCompressor
         final int hashRightShift = Long.SIZE - hashBits;
         final int intHashRightShift = Integer.SIZE - hashBits;
 
-        long[] cursor = this.cursor;
+        final long[] cursor = new long[4]; // per call: cannot be global as Strategy is share across threads
 
         while (input < inputLimit) {
             long currentLong = UNSAFE.getLong(inputBase, input);
