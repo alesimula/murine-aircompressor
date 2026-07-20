@@ -228,7 +228,8 @@ public class ZstdOutputStream
             // split - ART compiles a method as one register-allocation unit)
             byte[] ring = this.ring;
             if (ring == null) {
-                ring = this.ring = new byte[sizeRing(length)];
+                ring = new byte[sizeRing(length)];
+                this.ring = ring;
             }
             int position = this.ringPosition;
             int blockEnd = this.ringBlockEnd;
