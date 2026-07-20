@@ -17,6 +17,7 @@ import java.io.EOFException;
 import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.charset.Charset;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 
@@ -37,10 +38,26 @@ public class TarInputStream
     private String paxPath;
     private String paxSize;
     private String paxMtime;
+    private Charset nameCharset = UTF_8;
 
     public TarInputStream(InputStream in)
     {
         super(in);
+    }
+
+    /**
+     * The charset of the ustar name fields and of GNU long names, UTF-8 by default. USTAR does not
+     * record what character set its name fields hold, so an archive written by a tar that used the
+     * system locale needs that locale passed in here to read back unmangled. Applies to entries read
+     * after this call.
+     * <p>
+     * PAX records are not affected: POSIX.1-2001 defines them as UTF-8 and they are always read as
+     * such, so a name carried in a PAX record is decoded correctly whatever this is set to.
+     */
+    public TarInputStream withNameCharset(Charset nameCharset)
+    {
+        this.nameCharset = TarEntry.checkNameCharset(nameCharset);
+        return this;
     }
 
     /**
@@ -76,7 +93,7 @@ public class TarInputStream
         paxMtime = null;
         String gnuName = null;
         while (true) {
-            TarEntry entry = new TarEntry(block);
+            TarEntry entry = new TarEntry(block, nameCharset);
             char type = entry.getType();
             if (type == 'x' || type == 'g' || type == 'L' || type == 'K') {
                 byte[] data = readEntryData(entry);
@@ -90,7 +107,7 @@ public class TarInputStream
                     while (end < data.length && data[end] != 0) {
                         end++;
                     }
-                    gnuName = new String(data, 0, end, UTF_8);
+                    gnuName = new String(data, 0, end, nameCharset);
                 }
                 // 'g' (global) and 'K' (long link) records are ignored
                 if (!readBlock()) {

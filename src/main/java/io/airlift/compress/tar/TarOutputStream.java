@@ -16,6 +16,7 @@ package io.airlift.compress.tar;
 import java.io.FilterOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.nio.charset.Charset;
 import java.util.Arrays;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
@@ -35,6 +36,7 @@ public class TarOutputStream
     private boolean entryOpen;
     private boolean finished;
     private boolean unicodeNames = true;
+    private Charset nameCharset = UTF_8;
 
     public TarOutputStream(OutputStream out)
     {
@@ -57,6 +59,29 @@ public class TarOutputStream
         return this;
     }
 
+    /**
+     * The charset of the ustar name fields, UTF-8 by default. PAX records are not affected: they are
+     * UTF-8 by specification, and are still written for every name that is not plain ASCII, so the
+     * name stays unambiguous for any reader that understands them whatever this is set to. This only
+     * chooses what readers that ignore PAX see, and is worth changing only when writing for a known
+     * legacy consumer, usually together with {@link #setUnicodeNames(boolean)}.
+     *
+     * A name this charset cannot represent is rejected, unless a PAX record is being written for it (default),
+     * in which case the ustar fallback substitutes the characters it cannot encode and the PAX record
+     * carries the name in full.
+     *
+     * @throws IllegalArgumentException if the charset cannot encode ASCII as single-byte ASCII
+     * @throws IllegalStateException if the archive is already being written
+     */
+    public TarOutputStream withNameCharset(Charset nameCharset)
+    {
+        if (entryOpen || finished) {
+            throw new IllegalStateException("Archive is already being written");
+        }
+        this.nameCharset = TarEntry.checkNameCharset(nameCharset);
+        return this;
+    }
+
     public void putNextEntry(TarEntry entry)
             throws IOException
     {
@@ -66,21 +91,25 @@ public class TarOutputStream
         if (finished) {
             throw new IOException("Archive is finished");
         }
+        // PAX (POSIX.1-2001): a preceding 'x' entry carries the values that don't fit the ustar
+        // fields, or that need UTF-8 stated for them; the real header holds the fallbacks
+        boolean pax = !entry.fitsUstar(nameCharset) || (unicodeNames && !entry.hasAsciiName());
+        // checked before anything is written, so a rejected name cannot leave a half-written entry;
+        // when a PAX record carries the name, the ustar fallback is allowed to lose characters
+        TarEntry.checkName(entry.getName(), nameCharset, pax);
         TarEntry header = entry;
-        if (!entry.fitsUstar() || (unicodeNames && !entry.hasAsciiName())) {
-            // PAX (POSIX.1-2001): a preceding 'x' entry carries the values that don't fit the ustar
-            // fields, or that need UTF-8 stated for them; the real header holds the fallbacks
+        if (pax) {
             writePaxHeader(entry);
             String shortName = entry.getName();
-            if (!entry.nameFitsUstar()) {
-                shortName = TarEntry.truncateUtf8(shortName, 100);
+            if (!entry.nameFitsUstar(nameCharset)) {
+                shortName = TarEntry.truncate(shortName, 100, nameCharset);
                 if (entry.isDirectory() && !shortName.endsWith("/")) {
-                    shortName = TarEntry.truncateUtf8(shortName, 99) + "/";
+                    shortName = TarEntry.truncate(shortName, 99, nameCharset) + "/";
                 }
             }
             header = new TarEntry(shortName, entry.getSize(), entry.getMode()).setModTime(entry.getModTime());
         }
-        header.writeHeader(block);
+        header.writeHeader(block, nameCharset, pax);
         out.write(block);
         remaining = entry.getSize();
         padding = (int) (-remaining & 511);
@@ -159,7 +188,7 @@ public class TarOutputStream
         byte[] data = records.toString().getBytes(UTF_8);
         String name = entry.getName();
         TarEntry pax = new TarEntry(paxHeaderName(name), data.length).setType('x');
-        pax.writeHeader(block);
+        pax.writeHeader(block, nameCharset, true);
         out.write(block);
         out.write(data);
         int pad = -data.length & 511;

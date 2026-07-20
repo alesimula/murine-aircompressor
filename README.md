@@ -99,6 +99,21 @@ The size of each entry must be known up front and is passed to the `TarEntry` co
 handled transparently, written as PAX (POSIX.1-2001) extended headers, and read
 back from PAX or GNU extension records.
 
+Names with accents or non-Latin characters need no special handling: they are written as
+UTF-8, read back as UTF-8, and other tar tools will show them correctly.
+
+Two settings cover unusual cases. `withNameCharset` reads or writes names in a different
+charset, and is only needed for archives coming from, or destined for, older tools that
+used the system's own encoding. `setUnicodeNames(false)` drops the extra metadata that
+records the encoding, for readers too old to understand it.
+
+```java
+// only when the archive came from a tool that used the system's own encoding
+try (TarInputStream tar = new TarInputStream(in).withNameCharset(Charset.defaultCharset())) {
+    ...
+}
+```
+
 ```java
 // Writing (optionally wrap `out` in ZstdOutputStream for a compressed .tar.zst)
 try (TarOutputStream tar = new TarOutputStream(out)) {

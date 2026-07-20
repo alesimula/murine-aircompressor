@@ -15,9 +15,16 @@ package io.airlift.compress.tar;
 
 import java.io.IOException;
 import java.math.BigInteger;
+import java.nio.ByteBuffer;
+import java.nio.CharBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.Charset;
+import java.nio.charset.CharsetEncoder;
+import java.nio.charset.CodingErrorAction;
 import java.nio.file.Path;
 import java.util.Arrays;
 
+import static java.nio.charset.StandardCharsets.US_ASCII;
 import static java.nio.charset.StandardCharsets.UTF_8;
 
 /**
@@ -57,17 +64,19 @@ public class TarEntry
     }
 
     /**
-     * Parses a header block, verifying its checksum.
+     * Parses a header block, verifying its checksum. {@code nameCharset} decodes the ustar
+     * name fields, which carry no encoding of their own.
      */
-    TarEntry(byte[] header)
+    TarEntry(byte[] header, Charset nameCharset)
             throws IOException
     {
         long stored = parseOctal(header, 148, 8);
         if (stored != checksum(header, false) && stored != checksum(header, true)) {
             throw new IOException("Corrupt tar header (bad checksum)");
         }
-        String prefix = parseString(header, 345, 155);
-        name = prefix.isEmpty() ? parseString(header, 0, 100) : prefix + "/" + parseString(header, 0, 100);
+        String prefix = parseString(header, 345, 155, nameCharset);
+        String suffix = parseString(header, 0, 100, nameCharset);
+        name = prefix.isEmpty() ? suffix : prefix + "/" + suffix;
         mode = (int) parseOctalOrBinary(header, 100, 8);
         size = parseOctalOrBinary(header, 124, 12);
         if (size < 0) {
@@ -78,22 +87,24 @@ public class TarEntry
     }
 
     /**
-     * Fills a 512-byte block with this entry's header.
+     * Fills a 512-byte block with this entry's header, encoding the name with {@code nameCharset}.
+     * {@code lossyName} substitutes characters the charset cannot represent instead of rejecting
+     * them, and is for headers whose true name is carried in an accompanying PAX record.
      */
-    void writeHeader(byte[] block)
+    void writeHeader(byte[] block, Charset nameCharset, boolean lossyName)
     {
         Arrays.fill(block, (byte) 0);
         String suffix = name;
-        if (utf8Length(suffix) > 100) {
+        if (encodedLength(suffix, nameCharset) > 100) {
             // ustar name split: prefix field holds the leading directories
-            int slash = splitPoint(name);
+            int slash = splitPoint(name, nameCharset);
             if (slash < 0) {
                 throw new IllegalArgumentException("Entry name too long for ustar: " + name);
             }
-            writeString(block, 345, 155, name.substring(0, slash));
+            writeString(block, 345, 155, name.substring(0, slash), nameCharset, lossyName);
             suffix = name.substring(slash + 1);
         }
-        writeString(block, 0, 100, suffix);
+        writeString(block, 0, 100, suffix, nameCharset, lossyName);
         writeOctal(block, 100, 8, mode);
         writeOctal(block, 108, 8, 0); // uid
         writeOctal(block, 116, 8, 0); // gid
@@ -102,7 +113,7 @@ public class TarEntry
         writeOctal(block, 124, 12, size > MAX_OCTAL ? 0 : size);
         writeOctal(block, 136, 12, modTime / 1000);
         block[156] = (byte) type;
-        writeString(block, 257, 8, "ustar\000" + "00");
+        writeString(block, 257, 8, "ustar\000" + "00", US_ASCII, false);
         // checksum is computed with its own field read as spaces
         Arrays.fill(block, 148, 156, (byte) ' ');
         long sum = checksum(block, false);
@@ -187,17 +198,17 @@ public class TarEntry
     /**
      * True when name and size fit plain ustar fields; otherwise a PAX header is needed.
      */
-    boolean fitsUstar()
+    boolean fitsUstar(Charset nameCharset)
     {
-        return size <= MAX_OCTAL && nameFitsUstar();
+        return size <= MAX_OCTAL && nameFitsUstar(nameCharset);
     }
 
     /**
      * True when the name fits the ustar name field, on its own or split across the prefix field.
      */
-    boolean nameFitsUstar()
+    boolean nameFitsUstar(Charset nameCharset)
     {
-        return utf8Length(name) <= 100 || splitPoint(name) >= 0;
+        return encodedLength(name, nameCharset) <= 100 || splitPoint(name, nameCharset) >= 0;
     }
 
     /**
@@ -228,37 +239,62 @@ public class TarEntry
     }
 
     // ustar name split: index of the '/' whose prefix and suffix fit their fields, or -1
-    private static int splitPoint(String name)
+    private static int splitPoint(String name, Charset nameCharset)
     {
         for (int i = name.indexOf('/'); i >= 0; i = name.indexOf('/', i + 1)) {
-            if (utf8Length(name.substring(0, i)) <= 155 && utf8Length(name.substring(i + 1)) <= 100) {
+            if (encodedLength(name.substring(0, i), nameCharset) <= 155
+                    && encodedLength(name.substring(i + 1), nameCharset) <= 100) {
                 return i;
             }
         }
         return -1;
     }
 
-    // the header fields are sized in bytes, and a non-ASCII character takes several of them
-    static int utf8Length(String value)
+    // the header fields are sized in bytes, and one character can take several of them
+    static int encodedLength(String value, Charset nameCharset)
     {
-        return value.getBytes(UTF_8).length;
+        return value.getBytes(nameCharset).length;
     }
 
     /**
-     * Truncates to at most {@code maxBytes} of UTF-8, without splitting a character in half.
+     * Truncates to at most {@code maxBytes} once encoded, cutting between characters. Charsets that
+     * shift state between characters are measured conservatively, so the result may be shorter than
+     * it strictly has to be, never longer.
      */
-    static String truncateUtf8(String value, int maxBytes)
+    static String truncate(String value, int maxBytes, Charset nameCharset)
     {
-        byte[] bytes = value.getBytes(UTF_8);
-        if (bytes.length <= maxBytes) {
+        if (encodedLength(value, nameCharset) <= maxBytes) {
             return value;
         }
-        // back off over the continuation bytes of a character the cut landed inside
-        int end = maxBytes;
-        while (end > 0 && (bytes[end] & 0xC0) == 0x80) {
-            end--;
+        int bytes = 0;
+        int end = 0;
+        while (end < value.length()) {
+            int codePoint = value.codePointAt(end);
+            int width = encodedLength(new String(Character.toChars(codePoint)), nameCharset);
+            if (bytes + width > maxBytes) {
+                break;
+            }
+            bytes += width;
+            end += Character.charCount(codePoint);
         }
-        return new String(bytes, 0, end, UTF_8);
+        return value.substring(0, end);
+    }
+
+    /**
+     * Rejects charsets that cannot be used for ustar header fields: the fields are NUL terminated
+     * and the format's own syntax (the '/' separators, the magic, the octal digits) is ASCII, so a
+     * charset that renders ASCII as anything other than single-byte ASCII corrupts the header.
+     */
+    static Charset checkNameCharset(Charset nameCharset)
+    {
+        if (nameCharset == null) {
+            throw new IllegalArgumentException("nameCharset is null");
+        }
+        byte[] probe = "A/z0.".getBytes(nameCharset);
+        if (!Arrays.equals(probe, new byte[] {'A', '/', 'z', '0', '.'})) {
+            throw new IllegalArgumentException("Charset does not encode ASCII as single-byte ASCII: " + nameCharset);
+        }
+        return nameCharset;
     }
 
     private static long checksum(byte[] header, boolean signed)
@@ -353,13 +389,13 @@ public class TarEntry
         return negative ? -value.longValue() : value.longValue();
     }
 
-    private static String parseString(byte[] block, int offset, int length)
+    private static String parseString(byte[] block, int offset, int length, Charset charset)
     {
         int end = offset;
         while (end < offset + length && block[end] != 0) {
             end++;
         }
-        return new String(block, offset, end - offset, UTF_8);
+        return new String(block, offset, end - offset, charset);
     }
 
     private static void writeOctal(byte[] block, int offset, int length, long value)
@@ -371,12 +407,45 @@ public class TarEntry
         }
     }
 
-    private static void writeString(byte[] block, int offset, int length, String value)
+    private static void writeString(byte[] block, int offset, int length, String value, Charset charset, boolean lossy)
     {
-        byte[] bytes = value.getBytes(UTF_8);
+        byte[] bytes = encode(value, charset, lossy);
         if (bytes.length > length) {
             throw new IllegalArgumentException("Value too long for tar field: " + value);
         }
         System.arraycopy(bytes, 0, block, offset, bytes.length);
+    }
+
+    /**
+     * Checks that {@code name} can be written, so that a name that cannot is rejected before any of
+     * the entry reaches the stream. See {@link #encode} for what {@code lossy} allows through.
+     *
+     * @throws IllegalArgumentException if the name cannot be encoded
+     */
+    static void checkName(String name, Charset nameCharset, boolean lossy)
+    {
+        encode(name, nameCharset, lossy);
+    }
+
+    /**
+     * Malformed input, meaning a string that is not well-formed Unicode, is always rejected: no
+     * encoding can carry it, PAX included. A character the charset simply has no room for is
+     * rejected too unless {@code lossy}, in which case it is replaced, normally with '?'; that is
+     * for the ustar fields of an entry whose PAX record already carries the name in full.
+     */
+    private static byte[] encode(String value, Charset charset, boolean lossy)
+    {
+        CharsetEncoder encoder = charset.newEncoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(lossy ? CodingErrorAction.REPLACE : CodingErrorAction.REPORT);
+        try {
+            ByteBuffer encoded = encoder.encode(CharBuffer.wrap(value));
+            byte[] bytes = new byte[encoded.remaining()];
+            encoded.get(bytes);
+            return bytes;
+        }
+        catch (CharacterCodingException e) {
+            throw new IllegalArgumentException("Name cannot be encoded as " + charset + ": " + value);
+        }
     }
 }
