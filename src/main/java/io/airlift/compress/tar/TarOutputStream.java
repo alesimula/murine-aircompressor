@@ -115,6 +115,19 @@ public class TarOutputStream
         records.append(total).append(' ').append(key).append('=').append(value).append('\n');
     }
 
+    // the pax entry carries its own ustar header, so the name it borrows has to survive one:
+    // strip to 7 bits and replace what a reader would misparse
+    private static String paxHeaderName(String entryName)
+    {
+        StringBuilder stripped = new StringBuilder(entryName.length());
+        for (int i = 0; i < entryName.length(); i++) {
+            char c = (char) (entryName.charAt(i) & 0x7F);
+            stripped.append(c == 0 || c == '/' || c == '\\' ? '_' : c);
+        }
+        String name = "./PaxHeaders/" + stripped;
+        return name.length() > 99 ? name.substring(0, 99) : name;
+    }
+
     private void writePaxHeader(TarEntry entry)
             throws IOException
     {
@@ -125,7 +138,7 @@ public class TarOutputStream
         }
         byte[] data = records.toString().getBytes(UTF_8);
         String name = entry.getName();
-        TarEntry pax = new TarEntry("./PaxHeaders/" + name.substring(0, Math.min(name.length(), 80)), data.length).setType('x');
+        TarEntry pax = new TarEntry(paxHeaderName(name), data.length).setType('x');
         pax.writeHeader(block);
         out.write(block);
         out.write(data);

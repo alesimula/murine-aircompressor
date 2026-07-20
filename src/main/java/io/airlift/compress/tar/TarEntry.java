@@ -14,6 +14,8 @@
 package io.airlift.compress.tar;
 
 import java.io.IOException;
+import java.math.BigInteger;
+import java.nio.file.Path;
 import java.util.Arrays;
 
 import static java.nio.charset.StandardCharsets.US_ASCII;
@@ -66,9 +68,12 @@ public class TarEntry
         }
         String prefix = parseString(header, 345, 155);
         name = prefix.isEmpty() ? parseString(header, 0, 100) : prefix + "/" + parseString(header, 0, 100);
-        mode = (int) parseOctal(header, 100, 8);
-        size = parseOctal(header, 124, 12);
-        modTime = parseOctal(header, 136, 12) * 1000;
+        mode = (int) parseOctalOrBinary(header, 100, 8);
+        size = parseOctalOrBinary(header, 124, 12);
+        if (size < 0) {
+            throw new IOException("Corrupt tar header (negative entry size)");
+        }
+        modTime = parseOctalOrBinary(header, 136, 12) * 1000;
         type = header[156] == 0 ? TYPE_FILE : (char) header[156];
     }
 
@@ -108,6 +113,23 @@ public class TarEntry
     public String getName()
     {
         return name;
+    }
+
+    /**
+     * Resolves this entry's name against {@code parentPath}, rejecting names that escape it.
+     * Callers extracting to disk should use this instead of {@link #getName()}: entry names come
+     * from the archive and may contain "../" or be absolute.
+     *
+     * @throws IOException if the name would resolve outside {@code parentPath}
+     */
+    public Path resolveIn(Path parentPath)
+            throws IOException
+    {
+        Path resolved = parentPath.resolve(name).normalize();
+        if (!resolved.startsWith(parentPath)) {
+            throw new IOException("Zip slip '" + parentPath + "' + '" + name + "' -> '" + resolved + "'");
+        }
+        return resolved;
     }
 
     public long getSize()
@@ -203,32 +225,86 @@ public class TarEntry
         return sum;
     }
 
+    private static boolean isOctalDigit(byte b)
+    {
+        return b >= '0' && b <= '7';
+    }
+
+    // GNU base-256 (high bit of the first byte) or plain octal
+    private static long parseOctalOrBinary(byte[] block, int offset, int length)
+            throws IOException
+    {
+        if ((block[offset] & 0x80) == 0) {
+            return parseOctal(block, offset, length);
+        }
+        boolean negative = block[offset] == (byte) 0xFF;
+        if (length < 9) {
+            return parseBinaryLong(block, offset, length, negative);
+        }
+        return parseBinaryBigInteger(block, offset, length, negative);
+    }
+
     private static long parseOctal(byte[] block, int offset, int length)
             throws IOException
     {
-        if ((block[offset] & 0x80) != 0) {
-            // GNU base-256: high bit marks a big-endian binary field
-            long value = block[offset] & 0x7F;
-            for (int i = offset + 1; i < offset + length; i++) {
-                value = (value << 8) | (block[i] & 0xFF);
-            }
-            return value;
+        if (length < 2) {
+            throw new IOException("Corrupt tar header (octal field shorter than 2 bytes)");
+        }
+        int start = offset;
+        int end = offset + length;
+        if (block[start] == 0) {
+            return 0; // all-NUL means "field not set"
+        }
+        while (start < end && block[start] == ' ') {
+            start++;
+        }
+        // spec wants a trailing NUL or space, but some writers use it for an extra digit
+        while (start < end && (block[end - 1] == 0 || block[end - 1] == ' ')) {
+            end--;
         }
         long value = 0;
-        for (int i = offset; i < offset + length; i++) {
-            int b = block[i];
-            if (b == 0 || b == ' ') {
-                if (value > 0) {
-                    break;
-                }
-                continue; // leading padding
-            }
-            if (b < '0' || b > '7') {
+        for (; start < end; start++) {
+            byte current = block[start];
+            if (!isOctalDigit(current)) {
                 throw new IOException("Corrupt tar header (bad octal digit)");
             }
-            value = (value << 3) + (b - '0');
+            value = (value << 3) + (current - '0');
         }
         return value;
+    }
+
+    private static long parseBinaryLong(byte[] block, int offset, int length, boolean negative)
+            throws IOException
+    {
+        if (length >= 9) {
+            throw new IOException("Corrupt tar header (binary field exceeds long range)");
+        }
+        long value = 0;
+        for (int i = 1; i < length; i++) {
+            value = (value << 8) + (block[offset + i] & 0xFF);
+        }
+        if (negative) {
+            // 2's complement
+            value--;
+            value ^= (1L << ((length - 1) * 8)) - 1;
+        }
+        return negative ? -value : value;
+    }
+
+    private static long parseBinaryBigInteger(byte[] block, int offset, int length, boolean negative)
+            throws IOException
+    {
+        byte[] remainder = new byte[length - 1];
+        System.arraycopy(block, offset + 1, remainder, 0, length - 1);
+        BigInteger value = new BigInteger(remainder);
+        if (negative) {
+            // 2's complement
+            value = value.add(BigInteger.valueOf(-1)).not();
+        }
+        if (value.bitLength() > 63) {
+            throw new IOException("Corrupt tar header (binary field exceeds long range)");
+        }
+        return negative ? -value.longValue() : value.longValue();
     }
 
     private static String parseString(byte[] block, int offset, int length)

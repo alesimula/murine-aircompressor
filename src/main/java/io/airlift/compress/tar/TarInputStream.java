@@ -34,6 +34,9 @@ public class TarInputStream
     private long remaining;
     private int padding;
     private boolean eof;
+    private String paxPath;
+    private String paxSize;
+    private String paxMtime;
 
     public TarInputStream(InputStream in)
     {
@@ -68,9 +71,9 @@ public class TarInputStream
             eof = true; // end-of-archive marker (second zero block not required)
             return null;
         }
-        String paxPath = null;
-        String paxSize = null;
-        String paxMtime = null;
+        paxPath = null;
+        paxSize = null;
+        paxMtime = null;
         String gnuName = null;
         while (true) {
             TarEntry entry = new TarEntry(block);
@@ -78,28 +81,8 @@ public class TarInputStream
             if (type == 'x' || type == 'g' || type == 'L' || type == 'K') {
                 byte[] data = readEntryData(entry);
                 if (type == 'x') {
-                    // "<len> <key>=<value>\n" records; len spans the whole record
-                    int at = 0;
-                    while (at < data.length) {
-                        int space = at;
-                        while (data[space] != ' ') {
-                            space++;
-                        }
-                        int end = at + Integer.parseInt(new String(data, at, space - at, UTF_8));
-                        String record = new String(data, space + 1, end - space - 2, UTF_8); // minus '\n'
-                        int eq = record.indexOf('=');
-                        String key = record.substring(0, eq);
-                        String value = record.substring(eq + 1);
-                        if (key.equals("path")) {
-                            paxPath = value;
-                        }
-                        else if (key.equals("size")) {
-                            paxSize = value;
-                        }
-                        else if (key.equals("mtime")) {
-                            paxMtime = value;
-                        }
-                        at = end;
+                    for (int at = 0; at < data.length; ) {
+                        at = parsePaxRecord(data, at);
                     }
                 }
                 else if (type == 'L') {
@@ -122,15 +105,75 @@ public class TarInputStream
                 entry.setName(paxPath);
             }
             if (paxSize != null) {
-                entry.setSize(Long.parseLong(paxSize));
+                try {
+                    entry.setSize(Long.parseLong(paxSize));
+                }
+                catch (IllegalArgumentException e) {
+                    throw new IOException("Corrupt PAX header (bad size)");
+                }
             }
             if (paxMtime != null) {
-                entry.setModTime((long) (Double.parseDouble(paxMtime) * 1000));
+                try {
+                    entry.setModTime((long) (Double.parseDouble(paxMtime) * 1000));
+                }
+                catch (NumberFormatException e) {
+                    throw new IOException("Corrupt PAX header (bad mtime)");
+                }
             }
             remaining = entry.getSize();
             padding = (int) (-remaining & 511);
             return entry;
         }
+    }
+
+    /**
+     * Parses one "&lt;len&gt; &lt;key&gt;=&lt;value&gt;\n" record, where len spans the whole
+     * record including its own digits, and returns the offset of the next one.
+     */
+    private int parsePaxRecord(byte[] data, int at)
+            throws IOException
+    {
+        int digits = at;
+        int length = 0;
+        while (digits < data.length && data[digits] != ' ') {
+            byte b = data[digits];
+            if (b < '0' || b > '9') {
+                throw new IOException("Corrupt PAX header (non-digit in record length)");
+            }
+            length = length * 10 + (b - '0');
+            if (length > data.length) {
+                throw new IOException("Corrupt PAX header (record length exceeds header size)");
+            }
+            digits++;
+        }
+        int end = at + length;
+        // needs at least the digits, the space, one byte of "key=value" and the newline
+        if (digits >= data.length || length <= digits - at + 2 || end > data.length) {
+            throw new IOException("Corrupt PAX header (bad record length)");
+        }
+        if (data[end - 1] != '\n') {
+            throw new IOException("Corrupt PAX header (record does not end with a newline)");
+        }
+        String record = new String(data, digits + 1, end - digits - 2, UTF_8);
+        int equals = record.indexOf('=');
+        if (equals < 0) {
+            throw new IOException("Corrupt PAX header (record has no '=')");
+        }
+        String key = record.substring(0, equals);
+        String value = record.substring(equals + 1);
+        if (value.isEmpty()) {
+            return end; // empty value unsets the keyword
+        }
+        if (key.equals("path")) {
+            paxPath = value;
+        }
+        else if (key.equals("size")) {
+            paxSize = value;
+        }
+        else if (key.equals("mtime")) {
+            paxMtime = value;
+        }
+        return end;
     }
 
     /** Reads an extension entry's data in full, including its padding. */
