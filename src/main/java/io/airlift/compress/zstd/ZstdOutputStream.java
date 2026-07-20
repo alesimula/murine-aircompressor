@@ -39,6 +39,10 @@ public class ZstdOutputStream
     // chosen for run-to-run consistency on cache-constrained devices.
     private static final int RING_WINDOW_MULTIPLIER = 2;
 
+    // Ring mode: a single byte says nothing about how large the stream will be, so write(int)
+    // parks bytes here until a write that states a length arrives and the ring can be sized.
+    private static final int STAGING_RING = 1024;
+
     private final OutputStream outputStream;
     private final CompressionContext context;
     private final WindowSlideMode windowSlideMode;
@@ -138,7 +142,7 @@ public class ZstdOutputStream
             // everything allocated once, up front: no growth reallocations, no per-write work
             this.maxBufferSize = 0;
             this.ringCapacity = windowSize * RING_WINDOW_MULTIPLIER + blockSize;
-            // Sized on the first write (see sizeRing): a 100 KB stream must not allocate and
+            // Sized to demand (see sizeRing/reserveRing): a 100 KB stream must not allocate and
             // zero 2.2 MB. Slides still occur at ringCapacity, so output is unaffected.
             this.ring = null;
             this.ringBlockEnd = blockSize;
@@ -193,6 +197,13 @@ public class ZstdOutputStream
         }
 
         if (ringMode) {
+            if (ring == null) {
+                ring = new byte[min(STAGING_RING, blockSize)];
+            }
+            else if (ringPosition == ring.length && ring.length < blockSize) {
+                // staging is full and still no write that states a length: size on what is here
+                reserveRing(1);
+            }
             if (ringPosition == ringBlockEnd) {
                 completeRingBlock();
             }
@@ -226,10 +237,10 @@ public class ZstdOutputStream
             // ARM/ART hot path: a plain bounded copy loop with all state in locals; everything
             // that happens once per block lives in the outlined completeRingBlock() (hot/cold
             // split - ART compiles a method as one register-allocation unit)
+            // sizes the ring on the first write that states a length, staged bytes included
             byte[] ring = this.ring;
-            if (ring == null) {
-                ring = new byte[sizeRing(length)];
-                this.ring = ring;
+            if (ring == null || ring.length < blockSize) {
+                ring = reserveRing(length);
             }
             int position = this.ringPosition;
             int blockEnd = this.ringBlockEnd;
@@ -307,15 +318,31 @@ public class ZstdOutputStream
 
     // cold path, runs once per completed block
     /**
-     * Ring size for a stream whose first write is {@code firstWrite} bytes: enough for that write
-     * plus one block, rounded to a whole block, capped at the full ring. Streams that fit stay
-     * small; larger ones take a single growth to capacity.
+     * Ring size for {@code pending} bytes of data: enough for them plus one block, rounded to a
+     * whole block, capped at the full ring. Streams that fit stay small.
      */
-    private int sizeRing(int firstWrite)
+    private int sizeRing(long pending)
     {
-        long wanted = (long) firstWrite + blockSize;
+        long wanted = pending + blockSize;
         long rounded = ((wanted + blockSize - 1) / blockSize) * blockSize;
         return (int) Math.max(blockSize, Math.min(ringCapacity, rounded));
+    }
+
+    /**
+     * Sizes the ring for {@code incoming} bytes on top of anything staged by {@link #write(int)},
+     * which is at most {@link #STAGING_RING} bytes and is copied across. Only ever called while
+     * the ring is absent or still staging, so this runs at most once per stream; growth after
+     * that belongs to {@link #completeRingBlock()}, whose demand arrives one block at a time and
+     * so goes straight to capacity rather than copying the ring on every block.
+     * <p>
+     * Growing never moves data and slides still only happen at {@code ringCapacity}, so where a
+     * stream slides, and therefore its output, does not depend on how its writes were chunked.
+     */
+    private byte[] reserveRing(int incoming)
+    {
+        int wanted = sizeRing((long) ringPosition + incoming);
+        ring = ring == null ? new byte[wanted] : Arrays.copyOf(ring, wanted);
+        return ring;
     }
 
     private void completeRingBlock()
