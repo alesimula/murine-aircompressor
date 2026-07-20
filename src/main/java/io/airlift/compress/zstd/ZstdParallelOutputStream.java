@@ -48,12 +48,28 @@ class ZstdParallelOutputStream
     // so steady-state chunk allocation is zero regardless of stream length
     private final ArrayDeque<byte[]> recycledChunks = new ArrayDeque<>();
 
+    // ByteArrayOutputStream.toByteArray() copies the whole frame again;
+    // No thread safety is needed for this stream.
+    private static final class FrameBuffer
+            extends ByteArrayOutputStream
+    {
+        FrameBuffer(int size)
+        {
+            super(size);
+        }
+
+        byte[] array()
+        {
+            return buf;
+        }
+    }
+
     private static final class PendingChunk
     {
-        final Future<byte[]> compressedFrame;
+        final Future<FrameBuffer> compressedFrame;
         final byte[] chunkBuffer;
 
-        PendingChunk(Future<byte[]> compressedFrame, byte[] chunkBuffer)
+        PendingChunk(Future<FrameBuffer> compressedFrame, byte[] chunkBuffer)
         {
             this.compressedFrame = compressedFrame;
             this.chunkBuffer = chunkBuffer;
@@ -167,13 +183,13 @@ class ZstdParallelOutputStream
         final WindowSlideMode mode = windowSlideMode;
         final BufferMode buffering = bufferMode;
         pending.addLast(new PendingChunk(executor.submit(() -> {
-            ByteArrayOutputStream compressedFrame = new ByteArrayOutputStream(min(length + 64, length / 2 + 1024));
+            FrameBuffer compressedFrame = new FrameBuffer(min(length + 64, length / 2 + 1024));
             // one plain ZstdOutputStream per frame, with all the settings of the original;
             // The chunk buffer is recycled.
             try (ZstdOutputStream frame = new ZstdOutputStream(compressedFrame, level, mode, buffering)) {
                 frame.write(data, 0, length);
             }
-            return compressedFrame.toByteArray();
+            return compressedFrame;
         }), data));
         anyChunkSubmitted = true;
 
@@ -187,7 +203,8 @@ class ZstdParallelOutputStream
     {
         PendingChunk oldest = pending.removeFirst();
         try {
-            outputStream.write(oldest.compressedFrame.get());
+            FrameBuffer frame = oldest.compressedFrame.get();
+            outputStream.write(frame.array(), 0, frame.size());
             recycledChunks.addLast(oldest.chunkBuffer); // safe: the worker is done with it
         }
         catch (InterruptedException e) {
