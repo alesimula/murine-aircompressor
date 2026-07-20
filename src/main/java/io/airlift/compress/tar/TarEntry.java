@@ -25,7 +25,6 @@ import java.nio.file.Path;
 import java.util.Arrays;
 
 import static java.nio.charset.StandardCharsets.US_ASCII;
-import static java.nio.charset.StandardCharsets.UTF_8;
 
 /**
  * A single entry of a USTAR (POSIX.1-1988) archive. Knows how to read and
