@@ -61,7 +61,9 @@ public class ZstdOutputStream
     private int uncompressedPosition;
 
     // RING_BUFFER mode state
-    private final byte[] ring;
+    // grows on demand up to ringCapacity: a 100 KB stream should not allocate and zero 2.2 MB
+    private byte[] ring;
+    private final int ringCapacity;
     private boolean ringHeaderWritten;
     private int ringPosition;
     private int ringBlockBegin;
@@ -135,12 +137,16 @@ public class ZstdOutputStream
         if (ringMode) {
             // everything allocated once, up front: no growth reallocations, no per-write work
             this.maxBufferSize = 0;
-            this.ring = new byte[windowSize * RING_WINDOW_MULTIPLIER + blockSize];
+            this.ringCapacity = windowSize * RING_WINDOW_MULTIPLIER + blockSize;
+            // Sized on the first write (see sizeRing): a 100 KB stream must not allocate and
+            // zero 2.2 MB. Slides still occur at ringCapacity, so output is unaffected.
+            this.ring = null;
             this.ringBlockEnd = blockSize;
         }
         else {
             this.maxBufferSize = windowSize * 4;
             this.ring = null;
+            this.ringCapacity = 0;
         }
     }
 
@@ -221,6 +227,9 @@ public class ZstdOutputStream
             // that happens once per block lives in the outlined completeRingBlock() (hot/cold
             // split - ART compiles a method as one register-allocation unit)
             byte[] ring = this.ring;
+            if (ring == null) {
+                ring = this.ring = new byte[sizeRing(length)];
+            }
             int position = this.ringPosition;
             int blockEnd = this.ringBlockEnd;
             while (length > 0) {
@@ -228,6 +237,7 @@ public class ZstdOutputStream
                 if (space == 0) {
                     this.ringPosition = position;
                     completeRingBlock();
+                    ring = this.ring; // completeRingBlock may have grown it
                     position = this.ringPosition;
                     blockEnd = this.ringBlockEnd;
                     space = blockEnd - position;
@@ -295,6 +305,18 @@ public class ZstdOutputStream
     // ------------------------------------------------------------------------------------------
 
     // cold path, runs once per completed block
+    /**
+     * Ring size for a stream whose first write is {@code firstWrite} bytes: enough for that write
+     * plus one block, rounded to a whole block, capped at the full ring. Streams that fit stay
+     * small; larger ones take a single growth to capacity.
+     */
+    private int sizeRing(int firstWrite)
+    {
+        long wanted = (long) firstWrite + blockSize;
+        long rounded = ((wanted + blockSize - 1) / blockSize) * blockSize;
+        return (int) Math.max(blockSize, Math.min(ringCapacity, rounded));
+    }
+
     private void completeRingBlock()
             throws IOException
     {
@@ -303,6 +325,13 @@ public class ZstdOutputStream
         // advance to the next block slot (only full blocks reach here)
         int blockBegin = ringBlockBegin + blockSize;
         int blockEnd = ringBlockEnd + blockSize;
+        if (blockEnd > ring.length && ring.length < ringCapacity) {
+            // Not full yet: grow instead of sliding, so slides still land exactly where a
+            // pre-allocated ring would put them and the output is unchanged. Go straight to
+            // full capacity - doubling would copy the buffer repeatedly on mid-sized streams.
+            ring = Arrays.copyOf(ring, ringCapacity);
+        }
+
         if (blockEnd > ring.length) {
             int slide = blockBegin - windowSize;
             if (slide > 0) {
