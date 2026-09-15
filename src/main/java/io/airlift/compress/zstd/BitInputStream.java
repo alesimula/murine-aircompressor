@@ -13,6 +13,7 @@
  */
 package io.airlift.compress.zstd;
 
+import static io.airlift.compress.UnsafeUtil.SPLIT_LONGS;
 import static io.airlift.compress.UnsafeUtil.UNSAFE;
 import static io.airlift.compress.zstd.Constants.SIZE_OF_LONG;
 import static io.airlift.compress.zstd.Util.highestBit;
@@ -88,6 +89,7 @@ class BitInputStream
 
     static int initializeBits(Object inputBase, long startAddress, long endAddress, long[] scratch)
     {
+        final boolean split = SPLIT_LONGS;
         verify(endAddress - startAddress >= 1, startAddress, "Bitstream is empty");
 
         int lastByte = UNSAFE.getByte(inputBase, endAddress - 1) & 0xFF;
@@ -100,7 +102,7 @@ class BitInputStream
         int inputSize = (int) (endAddress - startAddress);
         if (inputSize >= SIZE_OF_LONG) {  /* normal case */
             currentAddress = endAddress - SIZE_OF_LONG;
-            bits = UNSAFE.getLong(inputBase, currentAddress);
+            bits = (split ? ((UNSAFE.getInt(inputBase, currentAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, currentAddress + 4) << 32)) : UNSAFE.getLong(inputBase, currentAddress));
         }
         else {
             currentAddress = startAddress;
@@ -116,6 +118,7 @@ class BitInputStream
 
     static int loadBits(Object inputBase, long startAddress, long currentAddress, long bits, int bitsConsumed, long[] scratch)
     {
+        final boolean split = SPLIT_LONGS;
         // identical logic to Loader.load()
         if (bitsConsumed > 64) {
             scratch[0] = bits;
@@ -132,7 +135,7 @@ class BitInputStream
         if (currentAddress >= startAddress + SIZE_OF_LONG) {
             if (bytes > 0) {
                 currentAddress -= bytes;
-                bits = UNSAFE.getLong(inputBase, currentAddress);
+                bits = (split ? ((UNSAFE.getInt(inputBase, currentAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, currentAddress + 4) << 32)) : UNSAFE.getLong(inputBase, currentAddress));
             }
             bitsConsumed &= 0b111;
         }
@@ -140,7 +143,7 @@ class BitInputStream
             bytes = (int) (currentAddress - startAddress);
             currentAddress = startAddress;
             bitsConsumed -= bytes * SIZE_OF_LONG;
-            bits = UNSAFE.getLong(inputBase, startAddress);
+            bits = (split ? ((UNSAFE.getInt(inputBase, startAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, startAddress + 4) << 32)) : UNSAFE.getLong(inputBase, startAddress));
             scratch[0] = bits;
             scratch[1] = currentAddress;
             return bitsConsumed | LOAD_DONE;
@@ -148,7 +151,7 @@ class BitInputStream
         else {
             currentAddress -= bytes;
             bitsConsumed -= bytes * SIZE_OF_LONG;
-            bits = UNSAFE.getLong(inputBase, currentAddress);
+            bits = (split ? ((UNSAFE.getInt(inputBase, currentAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, currentAddress + 4) << 32)) : UNSAFE.getLong(inputBase, currentAddress));
         }
 
         scratch[0] = bits;
@@ -189,6 +192,7 @@ class BitInputStream
 
         public void initialize()
         {
+            final boolean split = SPLIT_LONGS;
             verify(endAddress - startAddress >= 1, startAddress, "Bitstream is empty");
 
             int lastByte = UNSAFE.getByte(inputBase, endAddress - 1) & 0xFF;
@@ -199,7 +203,7 @@ class BitInputStream
             int inputSize = (int) (endAddress - startAddress);
             if (inputSize >= SIZE_OF_LONG) {  /* normal case */
                 currentAddress = endAddress - SIZE_OF_LONG;
-                bits = UNSAFE.getLong(inputBase, currentAddress);
+                bits = (split ? ((UNSAFE.getInt(inputBase, currentAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, currentAddress + 4) << 32)) : UNSAFE.getLong(inputBase, currentAddress));
             }
             else {
                 currentAddress = startAddress;
@@ -250,6 +254,7 @@ class BitInputStream
 
         public boolean load()
         {
+            final boolean split = SPLIT_LONGS;
             if (bitsConsumed > 64) {
                 overflow = true;
                 return true;
@@ -263,7 +268,7 @@ class BitInputStream
             if (currentAddress >= startAddress + SIZE_OF_LONG) {
                 if (bytes > 0) {
                     currentAddress -= bytes;
-                    bits = UNSAFE.getLong(inputBase, currentAddress);
+                    bits = (split ? ((UNSAFE.getInt(inputBase, currentAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, currentAddress + 4) << 32)) : UNSAFE.getLong(inputBase, currentAddress));
                 }
                 bitsConsumed &= 0b111;
             }
@@ -271,13 +276,13 @@ class BitInputStream
                 bytes = (int) (currentAddress - startAddress);
                 currentAddress = startAddress;
                 bitsConsumed -= bytes * SIZE_OF_LONG;
-                bits = UNSAFE.getLong(inputBase, startAddress);
+                bits = (split ? ((UNSAFE.getInt(inputBase, startAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, startAddress + 4) << 32)) : UNSAFE.getLong(inputBase, startAddress));
                 return true;
             }
             else {
                 currentAddress -= bytes;
                 bitsConsumed -= bytes * SIZE_OF_LONG;
-                bits = UNSAFE.getLong(inputBase, currentAddress);
+                bits = (split ? ((UNSAFE.getInt(inputBase, currentAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, currentAddress + 4) << 32)) : UNSAFE.getLong(inputBase, currentAddress));
             }
 
             return false;

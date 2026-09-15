@@ -15,6 +15,7 @@ package io.airlift.compress.lz4;
 
 import java.util.Arrays;
 
+import static io.airlift.compress.UnsafeUtil.SPLIT_LONGS;
 import static io.airlift.compress.UnsafeUtil.UNSAFE;
 import static io.airlift.compress.UnsafeUtil.copyMemory;
 import static io.airlift.compress.lz4.Lz4Constants.LAST_LITERAL_SIZE;
@@ -92,6 +93,7 @@ public final class Lz4RawCompressor
             final int[] table,
             final int acceleration)
     {
+        final boolean split = SPLIT_LONGS;
         if (acceleration < DEFAULT_ACCELERATION || acceleration > MAX_ACCELERATION) {
             throw new IllegalArgumentException("LZ4 acceleration must be in [" + DEFAULT_ACCELERATION + ", " + MAX_ACCELERATION + "] but got " + acceleration);
         }
@@ -124,10 +126,10 @@ public final class Lz4RawCompressor
 
         // First Byte
         // put position in hash
-        table[hash(UNSAFE.getLong(inputBase, input), mask)] = (int) (input - inputAddress);
+        table[hash((split ? ((UNSAFE.getInt(inputBase, input) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, input + 4) << 32)) : UNSAFE.getLong(inputBase, input)), mask)] = (int) (input - inputAddress);
 
         input++;
-        int nextHash = hash(UNSAFE.getLong(inputBase, input), mask);
+        int nextHash = hash((split ? ((UNSAFE.getInt(inputBase, input) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, input + 4) << 32)) : UNSAFE.getLong(inputBase, input)), mask);
 
         boolean done = false;
         do {
@@ -150,7 +152,7 @@ public final class Lz4RawCompressor
 
                 // get position on hash
                 matchIndex = inputAddress + table[hash];
-                nextHash = hash(UNSAFE.getLong(inputBase, nextInputIndex), mask);
+                nextHash = hash((split ? ((UNSAFE.getInt(inputBase, nextInputIndex) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, nextInputIndex + 4) << 32)) : UNSAFE.getLong(inputBase, nextInputIndex)), mask);
 
                 // put position on hash
                 table[hash] = (int) (input - inputAddress);
@@ -185,16 +187,16 @@ public final class Lz4RawCompressor
                 }
 
                 long position = input - 2;
-                table[hash(UNSAFE.getLong(inputBase, position), mask)] = (int) (position - inputAddress);
+                table[hash((split ? ((UNSAFE.getInt(inputBase, position) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, position + 4) << 32)) : UNSAFE.getLong(inputBase, position)), mask)] = (int) (position - inputAddress);
 
                 // Test next position
-                int hash = hash(UNSAFE.getLong(inputBase, input), mask);
+                int hash = hash((split ? ((UNSAFE.getInt(inputBase, input) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, input + 4) << 32)) : UNSAFE.getLong(inputBase, input)), mask);
                 matchIndex = inputAddress + table[hash];
                 table[hash] = (int) (input - inputAddress);
 
                 if (matchIndex + MAX_DISTANCE < input || UNSAFE.getInt(inputBase, matchIndex) != UNSAFE.getInt(inputBase, input)) {
                     input++;
-                    nextHash = hash(UNSAFE.getLong(inputBase, input), mask);
+                    nextHash = hash((split ? ((UNSAFE.getInt(inputBase, input) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, input + 4) << 32)) : UNSAFE.getLong(inputBase, input)), mask);
                     break;
                 }
 
@@ -213,11 +215,19 @@ public final class Lz4RawCompressor
 
     private static long emitLiteral(Object inputBase, Object outputBase, long input, int literalLength, long output)
     {
+        final boolean split = SPLIT_LONGS;
         output = encodeRunLength(outputBase, output, literalLength);
 
         final long outputLimit = output + literalLength;
         do {
-            UNSAFE.putLong(outputBase, output, UNSAFE.getLong(inputBase, input));
+            if (split) {
+                long splitValue = ((UNSAFE.getInt(inputBase, input) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, input + 4) << 32));
+                UNSAFE.putInt(outputBase, output, (int) splitValue);
+                UNSAFE.putInt(outputBase, output + 4, (int) (splitValue >>> 32));
+            }
+            else {
+                UNSAFE.putLong(outputBase, output, UNSAFE.getLong(inputBase, input));
+            }
             input += SIZE_OF_LONG;
             output += SIZE_OF_LONG;
         }
@@ -259,6 +269,7 @@ public final class Lz4RawCompressor
      */
     static int count(Object inputBase, final long inputAddress, final long inputLimit, final long matchAddress)
     {
+        final boolean split = SPLIT_LONGS;
         long input = inputAddress;
         long match = matchAddress;
 
@@ -267,7 +278,7 @@ public final class Lz4RawCompressor
         // first, compare long at a time
         int count = 0;
         while (count < remaining - (SIZE_OF_LONG - 1)) {
-            long diff = UNSAFE.getLong(inputBase, match) ^ UNSAFE.getLong(inputBase, input);
+            long diff = (split ? ((UNSAFE.getInt(inputBase, match) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, match + 4) << 32)) : UNSAFE.getLong(inputBase, match)) ^ (split ? ((UNSAFE.getInt(inputBase, input) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, input + 4) << 32)) : UNSAFE.getLong(inputBase, input));
             if (diff != 0) {
                 return count + (Long.numberOfTrailingZeros(diff) >> 3);
             }

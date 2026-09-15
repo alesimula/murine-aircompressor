@@ -64,13 +64,29 @@ public final class UnsafeUtil
     // NoSuchFieldError on ART). The method that computes it exists on all Android versions.
     public static final int ARRAY_BYTE_BASE_OFFSET = UNSAFE.arrayBaseOffset(byte[].class);
 
+    // Murine: the codecs access 8 bytes at arbitrary offsets; on 32-bit ARM an unaligned
+    // LDRD/STRD is a SIGBUS, while 16/32-bit unaligned accesses are fine. So on 32-bit
+    // runtimes every 64-bit access is done as two getInt/putInt instead.
+    //
+    // The choice is manually inlined at every call site (no helper method on either branch)
+    // with the flag hoisted into a method-local:
+    //     final boolean split = SPLIT_LONGS;
+    //     split ? ((UNSAFE.getInt(b, o) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(b, o + 4) << 32))
+    //           : UNSAFE.getLong(b, o)
+    // ART only intrinsifies Unsafe calls it sees directly and won't inline helpers into the
+    // large codec methods, so a helper would cost a real call per 8 bytes.
+    // -Daircompressor.splitLongs=true forces the split path for testing on 64-bit hosts.
+    public static final boolean SPLIT_LONGS = UNSAFE.addressSize() == 4
+            || Boolean.getBoolean("aircompressor.splitLongs");
+
     public static long getAddress(Buffer buffer)
     {
+        final boolean split = SPLIT_LONGS;
         if (!buffer.isDirect()) {
             throw new IllegalArgumentException("buffer is not direct");
         }
 
-        return UNSAFE.getLong(buffer, ADDRESS_OFFSET);
+        return split ? ((UNSAFE.getInt(buffer, ADDRESS_OFFSET) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(buffer, ADDRESS_OFFSET + 4) << 32)) : UNSAFE.getLong(buffer, ADDRESS_OFFSET);
     }
 
     // Murine: Android's sun.misc.Unsafe has no copyMemory(Object, long, Object, long, long),
@@ -98,6 +114,7 @@ public final class UnsafeUtil
 
     public static void copyMemory(Object srcBase, long srcOffset, Object destBase, long destOffset, long length)
     {
+        final boolean split = SPLIT_LONGS;
         try {
             // OpenJDK (and any Android that grows the method): the real thing, all cases
             if (COPY_MEMORY != null) {
@@ -130,12 +147,30 @@ public final class UnsafeUtil
         // address-only accessors on ART (OpenJDK's null-base-as-absolute is not portable).
         long i = 0;
         for (; i + Long.BYTES <= length; i += Long.BYTES) {
-            long value = (srcBase == null) ? UNSAFE.getLong(srcOffset + i) : UNSAFE.getLong(srcBase, srcOffset + i);
-            if (destBase == null) {
-                UNSAFE.putLong(destOffset + i, value);
+            long value;
+            if (srcBase == null) {
+                value = split ? ((UNSAFE.getInt((srcOffset + i)) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt((srcOffset + i) + 4) << 32)) : UNSAFE.getLong(srcOffset + i);
             }
             else {
-                UNSAFE.putLong(destBase, destOffset + i, value);
+                value = split ? ((UNSAFE.getInt(srcBase, (srcOffset + i)) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(srcBase, (srcOffset + i) + 4) << 32)) : UNSAFE.getLong(srcBase, srcOffset + i);
+            }
+            if (destBase == null) {
+                if (split) {
+                    UNSAFE.putInt((destOffset + i), (int) value);
+                    UNSAFE.putInt((destOffset + i) + 4, (int) (value >>> 32));
+                }
+                else {
+                    UNSAFE.putLong(destOffset + i, value);
+                }
+            }
+            else {
+                if (split) {
+                    UNSAFE.putInt(destBase, (destOffset + i), (int) value);
+                    UNSAFE.putInt(destBase, (destOffset + i) + 4, (int) (value >>> 32));
+                }
+                else {
+                    UNSAFE.putLong(destBase, destOffset + i, value);
+                }
             }
         }
         for (; i < length; i++) {

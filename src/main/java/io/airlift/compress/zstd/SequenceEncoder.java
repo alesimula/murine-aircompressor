@@ -13,6 +13,7 @@
  */
 package io.airlift.compress.zstd;
 
+import static io.airlift.compress.UnsafeUtil.SPLIT_LONGS;
 import static io.airlift.compress.UnsafeUtil.UNSAFE;
 import static io.airlift.compress.zstd.Constants.DEFAULT_MAX_OFFSET_CODE_SYMBOL;
 import static io.airlift.compress.zstd.Constants.LITERALS_LENGTH_BITS;
@@ -244,6 +245,7 @@ class SequenceEncoder
             FseCompressionTable literalLengthTable,
             SequenceStore sequences)
     {
+        final boolean split = SPLIT_LONGS;
         byte[] matchLengthCodes = sequences.matchLengthCodes;
         byte[] offsetCodes = sequences.offsetCodes;
         byte[] literalLengthCodes = sequences.literalLengthCodes;
@@ -300,7 +302,13 @@ class SequenceEncoder
         bitCount += bits;
         // flush
         int flushedBytes = bitCount >>> 3;
-        UNSAFE.putLong(outputBase, currentAddress, container);
+        if (split) {
+            UNSAFE.putInt(outputBase, currentAddress, (int) container);
+            UNSAFE.putInt(outputBase, currentAddress + 4, (int) (container >>> 32));
+        }
+        else {
+            UNSAFE.putLong(outputBase, currentAddress, container);
+        }
         currentAddress += flushedBytes;
         if (currentAddress > bosLimit) {
             currentAddress = bosLimit;
@@ -337,7 +345,13 @@ class SequenceEncoder
 
                 if ((offsetBits + matchLengthBits + literalLengthBits >= 64 - 7 - (LITERAL_LENGTH_TABLE_LOG + MATCH_LENGTH_TABLE_LOG + OFFSET_TABLE_LOG))) {
                     flushedBytes = bitCount >>> 3;                      /* (7)*/
-                    UNSAFE.putLong(outputBase, currentAddress, container);
+                    if (split) {
+                        UNSAFE.putInt(outputBase, currentAddress, (int) container);
+                        UNSAFE.putInt(outputBase, currentAddress + 4, (int) (container >>> 32));
+                    }
+                    else {
+                        UNSAFE.putLong(outputBase, currentAddress, container);
+                    }
                     currentAddress += flushedBytes;
                     if (currentAddress > bosLimit) {
                         currentAddress = bosLimit;
@@ -350,7 +364,13 @@ class SequenceEncoder
                 bitCount += literalLengthBits;
                 if (((literalLengthBits + matchLengthBits) > 24)) {
                     flushedBytes = bitCount >>> 3;
-                    UNSAFE.putLong(outputBase, currentAddress, container);
+                    if (split) {
+                        UNSAFE.putInt(outputBase, currentAddress, (int) container);
+                        UNSAFE.putInt(outputBase, currentAddress + 4, (int) (container >>> 32));
+                    }
+                    else {
+                        UNSAFE.putLong(outputBase, currentAddress, container);
+                    }
                     currentAddress += flushedBytes;
                     if (currentAddress > bosLimit) {
                         currentAddress = bosLimit;
@@ -363,7 +383,13 @@ class SequenceEncoder
                 bitCount += matchLengthBits;
                 if ((offsetBits + matchLengthBits + literalLengthBits > 56)) {
                     flushedBytes = bitCount >>> 3;
-                    UNSAFE.putLong(outputBase, currentAddress, container);
+                    if (split) {
+                        UNSAFE.putInt(outputBase, currentAddress, (int) container);
+                        UNSAFE.putInt(outputBase, currentAddress + 4, (int) (container >>> 32));
+                    }
+                    else {
+                        UNSAFE.putLong(outputBase, currentAddress, container);
+                    }
                     currentAddress += flushedBytes;
                     if (currentAddress > bosLimit) {
                         currentAddress = bosLimit;
@@ -376,7 +402,13 @@ class SequenceEncoder
                 bitCount += offsetBits;
                 // flush (7)
                 flushedBytes = bitCount >>> 3;
-                UNSAFE.putLong(outputBase, currentAddress, container);
+                if (split) {
+                    UNSAFE.putInt(outputBase, currentAddress, (int) container);
+                    UNSAFE.putInt(outputBase, currentAddress + 4, (int) (container >>> 32));
+                }
+                else {
+                    UNSAFE.putLong(outputBase, currentAddress, container);
+                }
                 currentAddress += flushedBytes;
                 if (currentAddress > bosLimit) {
                     currentAddress = bosLimit;
@@ -390,7 +422,13 @@ class SequenceEncoder
         container |= (matchLengthState & ((1L << matchLengthTable.log2Size) - 1)) << bitCount;
         bitCount += matchLengthTable.log2Size;
         flushedBytes = bitCount >>> 3;
-        UNSAFE.putLong(outputBase, currentAddress, container);
+        if (split) {
+            UNSAFE.putInt(outputBase, currentAddress, (int) container);
+            UNSAFE.putInt(outputBase, currentAddress + 4, (int) (container >>> 32));
+        }
+        else {
+            UNSAFE.putLong(outputBase, currentAddress, container);
+        }
         currentAddress += flushedBytes;
         if (currentAddress > bosLimit) {
             currentAddress = bosLimit;
@@ -401,7 +439,13 @@ class SequenceEncoder
         container |= (offsetState & ((1L << offsetsTable.log2Size) - 1)) << bitCount;
         bitCount += offsetsTable.log2Size;
         flushedBytes = bitCount >>> 3;
-        UNSAFE.putLong(outputBase, currentAddress, container);
+        if (split) {
+            UNSAFE.putInt(outputBase, currentAddress, (int) container);
+            UNSAFE.putInt(outputBase, currentAddress + 4, (int) (container >>> 32));
+        }
+        else {
+            UNSAFE.putLong(outputBase, currentAddress, container);
+        }
         currentAddress += flushedBytes;
         if (currentAddress > bosLimit) {
             currentAddress = bosLimit;
@@ -412,7 +456,13 @@ class SequenceEncoder
         container |= (literalLengthState & ((1L << literalLengthTable.log2Size) - 1)) << bitCount;
         bitCount += literalLengthTable.log2Size;
         flushedBytes = bitCount >>> 3;
-        UNSAFE.putLong(outputBase, currentAddress, container);
+        if (split) {
+            UNSAFE.putInt(outputBase, currentAddress, (int) container);
+            UNSAFE.putInt(outputBase, currentAddress + 4, (int) (container >>> 32));
+        }
+        else {
+            UNSAFE.putLong(outputBase, currentAddress, container);
+        }
         currentAddress += flushedBytes;
         if (currentAddress > bosLimit) {
             currentAddress = bosLimit;
@@ -424,7 +474,13 @@ class SequenceEncoder
         container |= 1L << bitCount;
         bitCount += 1;
         flushedBytes = bitCount >>> 3;
-        UNSAFE.putLong(outputBase, currentAddress, container);
+        if (split) {
+            UNSAFE.putInt(outputBase, currentAddress, (int) container);
+            UNSAFE.putInt(outputBase, currentAddress + 4, (int) (container >>> 32));
+        }
+        else {
+            UNSAFE.putLong(outputBase, currentAddress, container);
+        }
         currentAddress += flushedBytes;
         if (currentAddress > bosLimit) {
             currentAddress = bosLimit;

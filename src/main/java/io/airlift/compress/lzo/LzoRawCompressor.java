@@ -15,6 +15,7 @@ package io.airlift.compress.lzo;
 
 import java.util.Arrays;
 
+import static io.airlift.compress.UnsafeUtil.SPLIT_LONGS;
 import static io.airlift.compress.UnsafeUtil.UNSAFE;
 import static io.airlift.compress.UnsafeUtil.copyMemory;
 import static io.airlift.compress.lzo.LzoConstants.SIZE_OF_INT;
@@ -76,6 +77,7 @@ public final class LzoRawCompressor
             final long maxOutputLength,
             final int[] table)
     {
+        final boolean split = SPLIT_LONGS;
         int tableSize = computeTableSize(inputLength);
         Arrays.fill(table, 0, tableSize, 0);
 
@@ -110,10 +112,10 @@ public final class LzoRawCompressor
 
         // First Byte
         // put position in hash
-        table[hash(UNSAFE.getLong(inputBase, input), mask)] = (int) (input - inputAddress);
+        table[hash((split ? ((UNSAFE.getInt(inputBase, input) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, input + 4) << 32)) : UNSAFE.getLong(inputBase, input)), mask)] = (int) (input - inputAddress);
 
         input++;
-        int nextHash = hash(UNSAFE.getLong(inputBase, input), mask);
+        int nextHash = hash((split ? ((UNSAFE.getInt(inputBase, input) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, input + 4) << 32)) : UNSAFE.getLong(inputBase, input)), mask);
 
         boolean done = false;
         boolean firstLiteral = true;
@@ -138,7 +140,7 @@ public final class LzoRawCompressor
 
                 // get position on hash
                 matchIndex = inputAddress + table[hash];
-                nextHash = hash(UNSAFE.getLong(inputBase, nextInputIndex), mask);
+                nextHash = hash((split ? ((UNSAFE.getInt(inputBase, nextInputIndex) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, nextInputIndex + 4) << 32)) : UNSAFE.getLong(inputBase, nextInputIndex)), mask);
 
                 // put position on hash
                 table[hash] = (int) (input - inputAddress);
@@ -176,16 +178,16 @@ public final class LzoRawCompressor
                 }
 
                 long position = input - 2;
-                table[hash(UNSAFE.getLong(inputBase, position), mask)] = (int) (position - inputAddress);
+                table[hash((split ? ((UNSAFE.getInt(inputBase, position) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, position + 4) << 32)) : UNSAFE.getLong(inputBase, position)), mask)] = (int) (position - inputAddress);
 
                 // Test next position
-                int hash = hash(UNSAFE.getLong(inputBase, input), mask);
+                int hash = hash((split ? ((UNSAFE.getInt(inputBase, input) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, input + 4) << 32)) : UNSAFE.getLong(inputBase, input)), mask);
                 matchIndex = inputAddress + table[hash];
                 table[hash] = (int) (input - inputAddress);
 
                 if (matchIndex + MAX_DISTANCE < input || UNSAFE.getInt(inputBase, matchIndex) != UNSAFE.getInt(inputBase, input)) {
                     input++;
-                    nextHash = hash(UNSAFE.getLong(inputBase, input), mask);
+                    nextHash = hash((split ? ((UNSAFE.getInt(inputBase, input) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, input + 4) << 32)) : UNSAFE.getLong(inputBase, input)), mask);
                     break;
                 }
 
@@ -202,11 +204,12 @@ public final class LzoRawCompressor
 
     private static int count(Object inputBase, final long start, long matchStart, long matchLimit)
     {
+        final boolean split = SPLIT_LONGS;
         long current = start;
 
         // first, compare long at a time
         while (current < matchLimit - (SIZE_OF_LONG - 1)) {
-            long diff = UNSAFE.getLong(inputBase, matchStart) ^ UNSAFE.getLong(inputBase, current);
+            long diff = (split ? ((UNSAFE.getInt(inputBase, matchStart) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, matchStart + 4) << 32)) : UNSAFE.getLong(inputBase, matchStart)) ^ (split ? ((UNSAFE.getInt(inputBase, current) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, current + 4) << 32)) : UNSAFE.getLong(inputBase, current));
             if (diff != 0) {
                 current += Long.numberOfTrailingZeros(diff) >> 3;
                 return (int) (current - start);
@@ -262,11 +265,19 @@ public final class LzoRawCompressor
             long output,
             int literalLength)
     {
+        final boolean split = SPLIT_LONGS;
         output = encodeLiteralLength(firstLiteral, outputBase, output, literalLength);
 
         final long outputLimit = output + literalLength;
         do {
-            UNSAFE.putLong(outputBase, output, UNSAFE.getLong(inputBase, input));
+            if (split) {
+                long splitValue = ((UNSAFE.getInt(inputBase, input) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, input + 4) << 32));
+                UNSAFE.putInt(outputBase, output, (int) splitValue);
+                UNSAFE.putInt(outputBase, output + 4, (int) (splitValue >>> 32));
+            }
+            else {
+                UNSAFE.putLong(outputBase, output, UNSAFE.getLong(inputBase, input));
+            }
             input += SIZE_OF_LONG;
             output += SIZE_OF_LONG;
         }

@@ -13,6 +13,7 @@
  */
 package io.airlift.compress.zstd;
 
+import static io.airlift.compress.UnsafeUtil.SPLIT_LONGS;
 import static io.airlift.compress.UnsafeUtil.UNSAFE;
 import static io.airlift.compress.zstd.Constants.SIZE_OF_LONG;
 import static io.airlift.compress.zstd.Constants.SIZE_OF_SHORT;
@@ -83,6 +84,7 @@ class HuffmanCompressor
 
     public static int compressSingleStream(Object outputBase, long outputAddress, int outputSize, Object inputBase, long inputAddress, int inputSize, HuffmanCompressionTable table)
     {
+        final boolean split = SPLIT_LONGS;
         if (outputSize < SIZE_OF_LONG) {
             return 0;
         }
@@ -119,7 +121,13 @@ class HuffmanCompressor
                 bitCount += symbolBits[symbol];
                 // flush
                 flushedBytes = bitCount >>> 3;
-                UNSAFE.putLong(outputBase, currentAddress, container);
+                if (split) {
+                    UNSAFE.putInt(outputBase, currentAddress, (int) container);
+                    UNSAFE.putInt(outputBase, currentAddress + 4, (int) (container >>> 32));
+                }
+                else {
+                    UNSAFE.putLong(outputBase, currentAddress, container);
+                }
                 currentAddress += flushedBytes;
                 if (currentAddress > bosLimit) {
                     currentAddress = bosLimit;
@@ -147,7 +155,13 @@ class HuffmanCompressor
             bitCount += symbolBits[symbol];
             // flush
             flushedBytes = bitCount >>> 3;
-            UNSAFE.putLong(outputBase, currentAddress, container);
+            if (split) {
+                UNSAFE.putInt(outputBase, currentAddress, (int) container);
+                UNSAFE.putInt(outputBase, currentAddress + 4, (int) (container >>> 32));
+            }
+            else {
+                UNSAFE.putLong(outputBase, currentAddress, container);
+            }
             currentAddress += flushedBytes;
             if (currentAddress > bosLimit) {
                 currentAddress = bosLimit;
@@ -160,7 +174,13 @@ class HuffmanCompressor
         container |= 1L << bitCount;
         bitCount += 1;
         flushedBytes = bitCount >>> 3;
-        UNSAFE.putLong(outputBase, currentAddress, container);
+        if (split) {
+            UNSAFE.putInt(outputBase, currentAddress, (int) container);
+            UNSAFE.putInt(outputBase, currentAddress + 4, (int) (container >>> 32));
+        }
+        else {
+            UNSAFE.putLong(outputBase, currentAddress, container);
+        }
         currentAddress += flushedBytes;
         if (currentAddress > bosLimit) {
             currentAddress = bosLimit;

@@ -14,6 +14,7 @@
 package io.airlift.compress.xxhash;
 
 import static io.airlift.compress.UnsafeUtil.ARRAY_BYTE_BASE_OFFSET;
+import static io.airlift.compress.UnsafeUtil.SPLIT_LONGS;
 import static io.airlift.compress.UnsafeUtil.UNSAFE;
 import static java.lang.Long.rotateLeft;
 import static java.lang.Math.min;
@@ -174,8 +175,15 @@ public final class XxHash64JavaHasher
     @Override
     public XxHash64Hasher updateLE(long value)
     {
+        final boolean split = SPLIT_LONGS;
         byte[] bytes = new byte[8];
-        UNSAFE.putLong(bytes, (long) ARRAY_BYTE_BASE_OFFSET, value);
+        if (split) {
+            UNSAFE.putInt(bytes, ((long) ARRAY_BYTE_BASE_OFFSET), (int) value);
+            UNSAFE.putInt(bytes, ((long) ARRAY_BYTE_BASE_OFFSET) + 4, (int) (value >>> 32));
+        }
+        else {
+            UNSAFE.putLong(bytes, (long) ARRAY_BYTE_BASE_OFFSET, value);
+        }
         return update(bytes);
     }
 
@@ -260,7 +268,8 @@ public final class XxHash64JavaHasher
 
     private static long getLong(byte[] input, int index)
     {
-        return UNSAFE.getLong(input, ARRAY_BYTE_BASE_OFFSET + (long) index);
+        final boolean split = SPLIT_LONGS;
+        return (split ? ((UNSAFE.getInt(input, (ARRAY_BYTE_BASE_OFFSET + (long) index)) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(input, (ARRAY_BYTE_BASE_OFFSET + (long) index) + 4) << 32)) : UNSAFE.getLong(input, ARRAY_BYTE_BASE_OFFSET + (long) index));
     }
 
     private static int getInt(byte[] input, int index)

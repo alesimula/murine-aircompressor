@@ -17,6 +17,7 @@ import java.io.IOException;
 import java.io.InputStream;
 
 import static io.airlift.compress.UnsafeUtil.ARRAY_BYTE_BASE_OFFSET;
+import static io.airlift.compress.UnsafeUtil.SPLIT_LONGS;
 import static io.airlift.compress.UnsafeUtil.UNSAFE;
 import static io.airlift.compress.UnsafeUtil.copyMemory;
 import static io.airlift.compress.zstd.Constants.SIZE_OF_LONG;
@@ -132,12 +133,13 @@ final class XxHash64
 
     private int updateBody(Object base, long address, int length)
     {
+        final boolean split = SPLIT_LONGS;
         int remaining = length;
         while (remaining >= 32) {
-            v1 = mix(v1, UNSAFE.getLong(base, address));
-            v2 = mix(v2, UNSAFE.getLong(base, address + 8));
-            v3 = mix(v3, UNSAFE.getLong(base, address + 16));
-            v4 = mix(v4, UNSAFE.getLong(base, address + 24));
+            v1 = mix(v1, (split ? ((UNSAFE.getInt(base, address) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(base, address + 4) << 32)) : UNSAFE.getLong(base, address)));
+            v2 = mix(v2, (split ? ((UNSAFE.getInt(base, (address + 8)) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(base, (address + 8) + 4) << 32)) : UNSAFE.getLong(base, address + 8)));
+            v3 = mix(v3, (split ? ((UNSAFE.getInt(base, (address + 16)) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(base, (address + 16) + 4) << 32)) : UNSAFE.getLong(base, address + 16)));
+            v4 = mix(v4, (split ? ((UNSAFE.getInt(base, (address + 24)) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(base, (address + 24) + 4) << 32)) : UNSAFE.getLong(base, address + 24)));
 
             address += 32;
             remaining -= 32;
@@ -199,8 +201,9 @@ final class XxHash64
 
     private static long updateTail(long hash, Object base, long address, int index, int length)
     {
+        final boolean split = SPLIT_LONGS;
         while (index <= length - 8) {
-            hash = updateTail(hash, UNSAFE.getLong(base, address + index));
+            hash = updateTail(hash, (split ? ((UNSAFE.getInt(base, (address + index)) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(base, (address + index) + 4) << 32)) : UNSAFE.getLong(base, address + index)));
             index += 8;
         }
 
@@ -221,6 +224,7 @@ final class XxHash64
 
     private static long updateBody(long seed, Object base, long address, int length)
     {
+        final boolean split = SPLIT_LONGS;
         long v1 = seed + PRIME64_1 + PRIME64_2;
         long v2 = seed + PRIME64_2;
         long v3 = seed;
@@ -228,10 +232,10 @@ final class XxHash64
 
         int remaining = length;
         while (remaining >= 32) {
-            v1 = mix(v1, UNSAFE.getLong(base, address));
-            v2 = mix(v2, UNSAFE.getLong(base, address + 8));
-            v3 = mix(v3, UNSAFE.getLong(base, address + 16));
-            v4 = mix(v4, UNSAFE.getLong(base, address + 24));
+            v1 = mix(v1, (split ? ((UNSAFE.getInt(base, address) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(base, address + 4) << 32)) : UNSAFE.getLong(base, address)));
+            v2 = mix(v2, (split ? ((UNSAFE.getInt(base, (address + 8)) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(base, (address + 8) + 4) << 32)) : UNSAFE.getLong(base, address + 8)));
+            v3 = mix(v3, (split ? ((UNSAFE.getInt(base, (address + 16)) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(base, (address + 16) + 4) << 32)) : UNSAFE.getLong(base, address + 16)));
+            v4 = mix(v4, (split ? ((UNSAFE.getInt(base, (address + 24)) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(base, (address + 24) + 4) << 32)) : UNSAFE.getLong(base, address + 24)));
 
             address += 32;
             remaining -= 32;

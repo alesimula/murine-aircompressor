@@ -13,6 +13,7 @@
  */
 package io.airlift.compress.zstd;
 
+import static io.airlift.compress.UnsafeUtil.SPLIT_LONGS;
 import static io.airlift.compress.UnsafeUtil.UNSAFE;
 import static io.airlift.compress.zstd.Constants.SIZE_OF_INT;
 import static io.airlift.compress.zstd.Constants.SIZE_OF_LONG;
@@ -34,6 +35,7 @@ class FastBlockCompressor
 
     public int compressBlock(Object inputBase, final long inputAddress, int inputSize, SequenceStore output, BlockCompressionState state, RepeatedOffsets offsets, CompressionParameters parameters)
     {
+        final boolean split = SPLIT_LONGS;
         int matchSearchLength = Math.max(parameters.getSearchLength(), 4);
         int hashBits = parameters.getHashLog();
         int[] hashTable = state.hashTable;
@@ -94,7 +96,7 @@ class FastBlockCompressor
         final long[] cursor = new long[4]; // per call: cannot be global as Strategy is share across threads
 
         while (input < inputLimit) {
-            long currentLong = UNSAFE.getLong(inputBase, input);
+            long currentLong = (split ? ((UNSAFE.getInt(inputBase, input) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, input + 4) << 32)) : UNSAFE.getLong(inputBase, input));
 
             int hash = intHash
                     ? ((int) currentLong * PRIME_4_BYTES) >>> intHashRightShift
@@ -132,6 +134,7 @@ class FastBlockCompressor
             int[] hashTable, boolean intHash, long hashPrime, int hashLeftShift, int hashRightShift, int intHashRightShift,
             SequenceStore output, long[] cursor)
     {
+        final boolean split = SPLIT_LONGS;
         int matchLength;
         int offset;
 
@@ -158,10 +161,10 @@ class FastBlockCompressor
 
         if (input <= inputLimit) {
             // fill table at matchStart + 2 and matchEnd - 2
-            long fillA = UNSAFE.getLong(inputBase, baseAddress + current + 2);
+            long fillA = (split ? ((UNSAFE.getInt(inputBase, (baseAddress + current + 2)) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, (baseAddress + current + 2) + 4) << 32)) : UNSAFE.getLong(inputBase, baseAddress + current + 2));
             hashTable[hashOf(fillA, intHash, hashPrime, hashLeftShift, hashRightShift, intHashRightShift)] = current + 2;
 
-            long fillB = UNSAFE.getLong(inputBase, input - 2);
+            long fillB = (split ? ((UNSAFE.getInt(inputBase, (input - 2)) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, (input - 2) + 4) << 32)) : UNSAFE.getLong(inputBase, input - 2));
             hashTable[hashOf(fillB, intHash, hashPrime, hashLeftShift, hashRightShift, intHashRightShift)] = (int) (input - 2 - baseAddress);
 
             while (input <= inputLimit && offset2 > 0 && UNSAFE.getInt(inputBase, input) == UNSAFE.getInt(inputBase, input - offset2)) {
@@ -171,7 +174,7 @@ class FastBlockCompressor
                 offset2 = offset1;
                 offset1 = temp;
 
-                hashTable[hashOf(UNSAFE.getLong(inputBase, input), intHash, hashPrime, hashLeftShift, hashRightShift, intHashRightShift)] = (int) (input - baseAddress);
+                hashTable[hashOf((split ? ((UNSAFE.getInt(inputBase, input) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, input + 4) << 32)) : UNSAFE.getLong(inputBase, input)), intHash, hashPrime, hashLeftShift, hashRightShift, intHashRightShift)] = (int) (input - baseAddress);
 
                 output.storeSequence(inputBase, anchor, 0, 0, repetitionLength - MIN_MATCH);
 

@@ -13,6 +13,7 @@
  */
 package io.airlift.compress.zstd;
 
+import static io.airlift.compress.UnsafeUtil.SPLIT_LONGS;
 import static io.airlift.compress.UnsafeUtil.UNSAFE;
 import static io.airlift.compress.zstd.Constants.SIZE_OF_LONG;
 import static io.airlift.compress.zstd.Util.checkArgument;
@@ -63,9 +64,16 @@ class BitOutputStream
 
     public void flush()
     {
+        final boolean split = SPLIT_LONGS;
         int bytes = bitCount >>> 3;
 
-        UNSAFE.putLong(outputBase, currentAddress, container);
+        if (split) {
+            UNSAFE.putInt(outputBase, currentAddress, (int) container);
+            UNSAFE.putInt(outputBase, currentAddress + 4, (int) (container >>> 32));
+        }
+        else {
+            UNSAFE.putLong(outputBase, currentAddress, container);
+        }
         currentAddress += bytes;
 
         if (currentAddress > outputLimit) {

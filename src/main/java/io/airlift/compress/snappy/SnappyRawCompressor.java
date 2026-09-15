@@ -15,6 +15,7 @@ package io.airlift.compress.snappy;
 
 import java.util.Arrays;
 
+import static io.airlift.compress.UnsafeUtil.SPLIT_LONGS;
 import static io.airlift.compress.UnsafeUtil.UNSAFE;
 import static io.airlift.compress.UnsafeUtil.copyMemory;
 import static io.airlift.compress.snappy.SnappyConstants.COPY_1_BYTE_OFFSET;
@@ -80,6 +81,7 @@ public final class SnappyRawCompressor
             final long outputLimit,
             final short[] table)
     {
+        final boolean split = SPLIT_LONGS;
         // The compression code assumes output is larger than the max compression size (with 32 bytes of
         // extra padding), and does not check bounds for writing to output.
         int maxCompressedLength = maxCompressedLength((int) (inputLimit - inputAddress));
@@ -203,7 +205,7 @@ public final class SnappyRawCompressor
 
                     // We could immediately start working at input now, but to improve
                     // compression we first update table[Hash(ip - 1, ...)].
-                    long longValue = UNSAFE.getLong(inputBase, input - 1);
+                    long longValue = (split ? ((UNSAFE.getInt(inputBase, (input - 1)) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, (input - 1) + 4) << 32)) : UNSAFE.getLong(inputBase, input - 1));
                     int prevInt = (int) longValue;
                     inputBytes = (int) (longValue >>> 8);
 
@@ -234,11 +236,12 @@ public final class SnappyRawCompressor
 
     private static int count(Object inputBase, final long start, long matchStart, long matchLimit)
     {
+        final boolean split = SPLIT_LONGS;
         long current = start;
 
         // first, compare long at a time
         while (current < matchLimit - (SIZE_OF_LONG - 1)) {
-            long diff = UNSAFE.getLong(inputBase, matchStart) ^ UNSAFE.getLong(inputBase, current);
+            long diff = (split ? ((UNSAFE.getInt(inputBase, matchStart) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, matchStart + 4) << 32)) : UNSAFE.getLong(inputBase, matchStart)) ^ (split ? ((UNSAFE.getInt(inputBase, current) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, current + 4) << 32)) : UNSAFE.getLong(inputBase, current));
             if (diff != 0) {
                 current += Long.numberOfTrailingZeros(diff) >> 3;
                 return (int) (current - start);
@@ -299,9 +302,17 @@ public final class SnappyRawCompressor
 
     private static long fastCopy(final Object inputBase, long input, final Object outputBase, long output, final int literalLength)
     {
+        final boolean split = SPLIT_LONGS;
         final long outputLimit = output + literalLength;
         do {
-            UNSAFE.putLong(outputBase, output, UNSAFE.getLong(inputBase, input));
+            if (split) {
+                long splitValue = ((UNSAFE.getInt(inputBase, input) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, input + 4) << 32));
+                UNSAFE.putInt(outputBase, output, (int) splitValue);
+                UNSAFE.putInt(outputBase, output + 4, (int) (splitValue >>> 32));
+            }
+            else {
+                UNSAFE.putLong(outputBase, output, UNSAFE.getLong(inputBase, input));
+            }
             input += SIZE_OF_LONG;
             output += SIZE_OF_LONG;
         }

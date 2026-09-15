@@ -14,6 +14,7 @@
 package io.airlift.compress.zstd;
 
 import static io.airlift.compress.UnsafeUtil.ARRAY_BYTE_BASE_OFFSET;
+import static io.airlift.compress.UnsafeUtil.SPLIT_LONGS;
 import static io.airlift.compress.UnsafeUtil.UNSAFE;
 import static io.airlift.compress.UnsafeUtil.copyMemory;
 import static io.airlift.compress.zstd.Constants.SIZE_OF_LONG;
@@ -81,11 +82,19 @@ class SequenceStore
 
     public void storeSequence(Object literalBase, long literalAddress, int literalLength, int offsetCode, int matchLengthBase)
     {
+        final boolean split = SPLIT_LONGS;
         long input = literalAddress;
         long output = ARRAY_BYTE_BASE_OFFSET + literalsLength;
         int copied = 0;
         do {
-            UNSAFE.putLong(literalsBuffer, output, UNSAFE.getLong(literalBase, input));
+            if (split) {
+                long splitValue = ((UNSAFE.getInt(literalBase, input) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(literalBase, input + 4) << 32));
+                UNSAFE.putInt(literalsBuffer, output, (int) splitValue);
+                UNSAFE.putInt(literalsBuffer, output + 4, (int) (splitValue >>> 32));
+            }
+            else {
+                UNSAFE.putLong(literalsBuffer, output, UNSAFE.getLong(literalBase, input));
+            }
             input += SIZE_OF_LONG;
             output += SIZE_OF_LONG;
             copied += SIZE_OF_LONG;

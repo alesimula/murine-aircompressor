@@ -18,6 +18,7 @@ import io.airlift.compress.MalformedInputException;
 import java.util.Arrays;
 
 import static io.airlift.compress.UnsafeUtil.ARRAY_BYTE_BASE_OFFSET;
+import static io.airlift.compress.UnsafeUtil.SPLIT_LONGS;
 import static io.airlift.compress.UnsafeUtil.UNSAFE;
 import static io.airlift.compress.UnsafeUtil.copyMemory;
 import static io.airlift.compress.zstd.BitInputStream.peekBits;
@@ -232,6 +233,7 @@ class ZstdFrameDecompressor
 
     static int decodeRleBlock(int size, Object inputBase, long inputAddress, Object outputBase, long outputAddress, long outputLimit)
     {
+        final boolean split = SPLIT_LONGS;
         verify(outputAddress + size <= outputLimit, inputAddress, "Output buffer too small");
 
         long output = outputAddress;
@@ -249,7 +251,13 @@ class ZstdFrameDecompressor
                     | (value << 56);
 
             do {
-                UNSAFE.putLong(outputBase, output, packed);
+                if (split) {
+                    UNSAFE.putInt(outputBase, output, (int) packed);
+                    UNSAFE.putInt(outputBase, output + 4, (int) (packed >>> 32));
+                }
+                else {
+                    UNSAFE.putLong(outputBase, output, packed);
+                }
                 output += SIZE_OF_LONG;
                 remaining -= SIZE_OF_LONG;
             }
@@ -317,6 +325,7 @@ class ZstdFrameDecompressor
             final Object literalsBase, final long literalsAddress, final long literalsLimit,
             long outputAbsoluteBaseAddress)
     {
+        final boolean split = SPLIT_LONGS;
         final long fastOutputLimit = outputLimit - SIZE_OF_LONG;
         final long fastMatchOutputLimit = fastOutputLimit - SIZE_OF_LONG;
 
@@ -410,7 +419,7 @@ class ZstdFrameDecompressor
                     if (currentAddress >= input + SIZE_OF_LONG) {
                         if (refillBytes > 0) {
                             currentAddress -= refillBytes;
-                            bits = UNSAFE.getLong(inputBase, currentAddress);
+                            bits = (split ? ((UNSAFE.getInt(inputBase, currentAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, currentAddress + 4) << 32)) : UNSAFE.getLong(inputBase, currentAddress));
                         }
                         bitsConsumed &= 0b111;
                     }
@@ -418,12 +427,12 @@ class ZstdFrameDecompressor
                         refillBytes = (int) (currentAddress - input);
                         currentAddress = input;
                         bitsConsumed -= refillBytes * SIZE_OF_LONG;
-                        bits = UNSAFE.getLong(inputBase, input);
+                        bits = (split ? ((UNSAFE.getInt(inputBase, input) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, input + 4) << 32)) : UNSAFE.getLong(inputBase, input));
                     }
                     else {
                         currentAddress -= refillBytes;
                         bitsConsumed -= refillBytes * SIZE_OF_LONG;
-                        bits = UNSAFE.getLong(inputBase, currentAddress);
+                        bits = (split ? ((UNSAFE.getInt(inputBase, currentAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, currentAddress + 4) << 32)) : UNSAFE.getLong(inputBase, currentAddress));
                     }
                 }
 
@@ -499,7 +508,7 @@ class ZstdFrameDecompressor
                     if (currentAddress >= input + SIZE_OF_LONG) {
                         if (refillBytes > 0) {
                             currentAddress -= refillBytes;
-                            bits = UNSAFE.getLong(inputBase, currentAddress);
+                            bits = (split ? ((UNSAFE.getInt(inputBase, currentAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, currentAddress + 4) << 32)) : UNSAFE.getLong(inputBase, currentAddress));
                         }
                         bitsConsumed &= 0b111;
                     }
@@ -507,12 +516,12 @@ class ZstdFrameDecompressor
                         refillBytes = (int) (currentAddress - input);
                         currentAddress = input;
                         bitsConsumed -= refillBytes * SIZE_OF_LONG;
-                        bits = UNSAFE.getLong(inputBase, input);
+                        bits = (split ? ((UNSAFE.getInt(inputBase, input) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, input + 4) << 32)) : UNSAFE.getLong(inputBase, input));
                     }
                     else {
                         currentAddress -= refillBytes;
                         bitsConsumed -= refillBytes * SIZE_OF_LONG;
-                        bits = UNSAFE.getLong(inputBase, currentAddress);
+                        bits = (split ? ((UNSAFE.getInt(inputBase, currentAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, currentAddress + 4) << 32)) : UNSAFE.getLong(inputBase, currentAddress));
                     }
                 }
 
@@ -573,6 +582,7 @@ class ZstdFrameDecompressor
 
     private static void copyMatchTail(Object outputBase, long fastOutputLimit, long output, long matchOutputLimit, long matchAddress, int matchLength, long fastMatchOutputLimit)
     {
+        final boolean split = SPLIT_LONGS;
         // fastMatchOutputLimit is just fastOutputLimit - SIZE_OF_LONG. It needs to be passed in so that it can be computed once for the
         // whole invocation to decompressSequences. Otherwise, we'd just compute it here.
         // If matchOutputLimit is < fastMatchOutputLimit, we know that even after the head (8 bytes) has been copied, the output pointer
@@ -580,7 +590,14 @@ class ZstdFrameDecompressor
         if (matchOutputLimit < fastMatchOutputLimit) {
             int copied = 0;
             do {
-                UNSAFE.putLong(outputBase, output, UNSAFE.getLong(outputBase, matchAddress));
+                if (split) {
+                    long splitValue = ((UNSAFE.getInt(outputBase, matchAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(outputBase, matchAddress + 4) << 32));
+                    UNSAFE.putInt(outputBase, output, (int) splitValue);
+                    UNSAFE.putInt(outputBase, output + 4, (int) (splitValue >>> 32));
+                }
+                else {
+                    UNSAFE.putLong(outputBase, output, UNSAFE.getLong(outputBase, matchAddress));
+                }
                 output += SIZE_OF_LONG;
                 matchAddress += SIZE_OF_LONG;
                 copied += SIZE_OF_LONG;
@@ -589,7 +606,14 @@ class ZstdFrameDecompressor
         }
         else {
             while (output < fastOutputLimit) {
-                UNSAFE.putLong(outputBase, output, UNSAFE.getLong(outputBase, matchAddress));
+                if (split) {
+                    long splitValue = ((UNSAFE.getInt(outputBase, matchAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(outputBase, matchAddress + 4) << 32));
+                    UNSAFE.putInt(outputBase, output, (int) splitValue);
+                    UNSAFE.putInt(outputBase, output + 4, (int) (splitValue >>> 32));
+                }
+                else {
+                    UNSAFE.putLong(outputBase, output, UNSAFE.getLong(outputBase, matchAddress));
+                }
                 matchAddress += SIZE_OF_LONG;
                 output += SIZE_OF_LONG;
             }
@@ -602,6 +626,7 @@ class ZstdFrameDecompressor
 
     private static long copyMatchHead(Object outputBase, long output, int offset, long matchAddress)
     {
+        final boolean split = SPLIT_LONGS;
         // copy match
         if (offset < 8) {
             // 8 bytes apart so that we can copy long-at-a-time below
@@ -618,7 +643,14 @@ class ZstdFrameDecompressor
             matchAddress -= decrement64;
         }
         else {
-            UNSAFE.putLong(outputBase, output, UNSAFE.getLong(outputBase, matchAddress));
+            if (split) {
+                long splitValue = ((UNSAFE.getInt(outputBase, matchAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(outputBase, matchAddress + 4) << 32));
+                UNSAFE.putInt(outputBase, output, (int) splitValue);
+                UNSAFE.putInt(outputBase, output + 4, (int) (splitValue >>> 32));
+            }
+            else {
+                UNSAFE.putLong(outputBase, output, UNSAFE.getLong(outputBase, matchAddress));
+            }
             matchAddress += SIZE_OF_LONG;
         }
         return matchAddress;
@@ -626,9 +658,17 @@ class ZstdFrameDecompressor
 
     private static long copyLiterals(Object outputBase, Object literalsBase, long output, long literalsInput, long literalOutputLimit)
     {
+        final boolean split = SPLIT_LONGS;
         long literalInput = literalsInput;
         do {
-            UNSAFE.putLong(outputBase, output, UNSAFE.getLong(literalsBase, literalInput));
+            if (split) {
+                long splitValue = ((UNSAFE.getInt(literalsBase, literalInput) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(literalsBase, literalInput + 4) << 32));
+                UNSAFE.putInt(outputBase, output, (int) splitValue);
+                UNSAFE.putInt(outputBase, output + 4, (int) (splitValue >>> 32));
+            }
+            else {
+                UNSAFE.putLong(outputBase, output, UNSAFE.getLong(literalsBase, literalInput));
+            }
             output += SIZE_OF_LONG;
             literalInput += SIZE_OF_LONG;
         }
@@ -723,11 +763,19 @@ class ZstdFrameDecompressor
 
     private void executeLastSequence(Object outputBase, long output, long literalOutputLimit, long matchOutputLimit, long fastOutputLimit, long literalInput, long matchAddress)
     {
+        final boolean split = SPLIT_LONGS;
         // copy literals
         if (output < fastOutputLimit) {
             // wild copy
             do {
-                UNSAFE.putLong(outputBase, output, UNSAFE.getLong(literalsBase, literalInput));
+                if (split) {
+                    long splitValue = ((UNSAFE.getInt(literalsBase, literalInput) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(literalsBase, literalInput + 4) << 32));
+                    UNSAFE.putInt(outputBase, output, (int) splitValue);
+                    UNSAFE.putInt(outputBase, output + 4, (int) (splitValue >>> 32));
+                }
+                else {
+                    UNSAFE.putLong(outputBase, output, UNSAFE.getLong(literalsBase, literalInput));
+                }
                 output += SIZE_OF_LONG;
                 literalInput += SIZE_OF_LONG;
             }
@@ -909,6 +957,7 @@ class ZstdFrameDecompressor
 
     static FrameHeader readFrameHeader(final Object inputBase, final long inputAddress, final long inputLimit)
     {
+        final boolean split = SPLIT_LONGS;
         long input = inputAddress;
         verify(input < inputLimit, input, "Not enough input bytes");
 
@@ -972,7 +1021,7 @@ class ZstdFrameDecompressor
                 input += SIZE_OF_INT;
                 break;
             case 3:
-                contentSize = UNSAFE.getLong(inputBase, input);
+                contentSize = (split ? ((UNSAFE.getInt(inputBase, input) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, input + 4) << 32)) : UNSAFE.getLong(inputBase, input));
                 input += SIZE_OF_LONG;
                 break;
         }

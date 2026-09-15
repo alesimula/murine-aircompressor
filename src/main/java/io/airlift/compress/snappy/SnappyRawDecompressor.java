@@ -15,6 +15,7 @@ package io.airlift.compress.snappy;
 
 import io.airlift.compress.MalformedInputException;
 
+import static io.airlift.compress.UnsafeUtil.SPLIT_LONGS;
 import static io.airlift.compress.UnsafeUtil.UNSAFE;
 import static io.airlift.compress.UnsafeUtil.copyMemory;
 import static io.airlift.compress.snappy.SnappyConstants.LITERAL;
@@ -76,6 +77,7 @@ public final class SnappyRawDecompressor
             final long outputAddress,
             final long outputLimit)
     {
+        final boolean split = SPLIT_LONGS;
         final long fastOutputLimit = outputLimit - SIZE_OF_LONG; // maximum offset in output buffer to which it's safe to write long-at-a-time
 
         long output = outputAddress;
@@ -136,7 +138,14 @@ public final class SnappyRawDecompressor
                 else {
                     // fast copy. We may over-copy but there's enough room in input and output to not overrun them
                     do {
-                        UNSAFE.putLong(outputBase, output, UNSAFE.getLong(inputBase, input));
+                        if (split) {
+                            long splitValue = ((UNSAFE.getInt(inputBase, input) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, input + 4) << 32));
+                            UNSAFE.putInt(outputBase, output, (int) splitValue);
+                            UNSAFE.putInt(outputBase, output + 4, (int) (splitValue >>> 32));
+                        }
+                        else {
+                            UNSAFE.putLong(outputBase, output, UNSAFE.getLong(inputBase, input));
+                        }
                         input += SIZE_OF_LONG;
                         output += SIZE_OF_LONG;
                     }
@@ -189,14 +198,28 @@ public final class SnappyRawDecompressor
                         matchAddress -= decrement64;
                     }
                     else {
-                        UNSAFE.putLong(outputBase, output, UNSAFE.getLong(outputBase, matchAddress));
+                        if (split) {
+                            long splitValue = ((UNSAFE.getInt(outputBase, matchAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(outputBase, matchAddress + 4) << 32));
+                            UNSAFE.putInt(outputBase, output, (int) splitValue);
+                            UNSAFE.putInt(outputBase, output + 4, (int) (splitValue >>> 32));
+                        }
+                        else {
+                            UNSAFE.putLong(outputBase, output, UNSAFE.getLong(outputBase, matchAddress));
+                        }
                         matchAddress += SIZE_OF_LONG;
                         output += SIZE_OF_LONG;
                     }
 
                     if (matchOutputLimit > fastOutputLimit) {
                         while (output < fastOutputLimit) {
-                            UNSAFE.putLong(outputBase, output, UNSAFE.getLong(outputBase, matchAddress));
+                            if (split) {
+                                long splitValue = ((UNSAFE.getInt(outputBase, matchAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(outputBase, matchAddress + 4) << 32));
+                                UNSAFE.putInt(outputBase, output, (int) splitValue);
+                                UNSAFE.putInt(outputBase, output + 4, (int) (splitValue >>> 32));
+                            }
+                            else {
+                                UNSAFE.putLong(outputBase, output, UNSAFE.getLong(outputBase, matchAddress));
+                            }
                             matchAddress += SIZE_OF_LONG;
                             output += SIZE_OF_LONG;
                         }
@@ -207,7 +230,14 @@ public final class SnappyRawDecompressor
                     }
                     else {
                         while (output < matchOutputLimit) {
-                            UNSAFE.putLong(outputBase, output, UNSAFE.getLong(outputBase, matchAddress));
+                            if (split) {
+                                long splitValue = ((UNSAFE.getInt(outputBase, matchAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(outputBase, matchAddress + 4) << 32));
+                                UNSAFE.putInt(outputBase, output, (int) splitValue);
+                                UNSAFE.putInt(outputBase, output + 4, (int) (splitValue >>> 32));
+                            }
+                            else {
+                                UNSAFE.putLong(outputBase, output, UNSAFE.getLong(outputBase, matchAddress));
+                            }
                             matchAddress += SIZE_OF_LONG;
                             output += SIZE_OF_LONG;
                         }
