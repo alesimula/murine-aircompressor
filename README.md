@@ -33,7 +33,7 @@ allprojects {
 Then add the dependency:
 
 ```gradle
-    implementation 'com.github.alesimula:murine-aircompressor:2.0.12'
+    implementation 'com.github.alesimula:murine-aircompressor:2.0.13'
 ```
 
 **Using Maven**
@@ -51,7 +51,7 @@ Then add the dependency:
 <dependency>
     <groupId>com.github.alesimula</groupId>
     <artifactId>murine-aircompressor</artifactId>
-    <version>2.0.12</version>
+    <version>2.0.13</version>
 </dependency>
 ```
 
