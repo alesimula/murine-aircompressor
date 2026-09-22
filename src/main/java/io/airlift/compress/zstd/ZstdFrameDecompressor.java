@@ -630,17 +630,28 @@ class ZstdFrameDecompressor
         // copy match
         if (offset < 8) {
             // 8 bytes apart so that we can copy long-at-a-time below
-            int increment32 = DEC_32_TABLE[offset];
-            int decrement64 = DEC_64_TABLE[offset];
-
-            UNSAFE.putByte(outputBase, output, UNSAFE.getByte(outputBase, matchAddress));
-            UNSAFE.putByte(outputBase, output + 1, UNSAFE.getByte(outputBase, matchAddress + 1));
-            UNSAFE.putByte(outputBase, output + 2, UNSAFE.getByte(outputBase, matchAddress + 2));
-            UNSAFE.putByte(outputBase, output + 3, UNSAFE.getByte(outputBase, matchAddress + 3));
-            matchAddress += increment32;
-
-            UNSAFE.putInt(outputBase, output + 4, UNSAFE.getInt(outputBase, matchAddress));
-            matchAddress -= decrement64;
+            // ARM/ART: the 8 output bytes repeat the first `offset` bytes; build that pattern in a
+            // register and write it once, instead of 4 getByte/putByte pairs (JNI calls on ART
+            // builds that don't intrinsify them). Reading 8 bytes at matchAddress stays below
+            // output + 8, which the caller guarantees is writable.
+            long pattern = (split ? ((UNSAFE.getInt(outputBase, matchAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(outputBase, matchAddress + 4) << 32)) : UNSAFE.getLong(outputBase, matchAddress));
+            int period = offset * Byte.SIZE;
+            pattern &= (1L << period) - 1;
+            pattern |= pattern << period;              // 2 * offset bytes: enough for offset >= 4
+            if (offset < 4) {
+                pattern |= pattern << (period * 2);    // 4 * offset: enough for offset 2..3
+                if (offset < 2) {
+                    pattern |= pattern << (period * 4); // offset 1
+                }
+            }
+            if (split) {
+                UNSAFE.putInt(outputBase, output, (int) pattern);
+                UNSAFE.putInt(outputBase, output + 4, (int) (pattern >>> 32));
+            }
+            else {
+                UNSAFE.putLong(outputBase, output, pattern);
+            }
+            matchAddress += DEC_32_TABLE[offset] - DEC_64_TABLE[offset];
         }
         else {
             if (split) {

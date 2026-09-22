@@ -15,10 +15,12 @@ package io.airlift.compress.zstd;
 
 import java.util.Arrays;
 
+import static io.airlift.compress.UnsafeUtil.SPLIT_LONGS;
 import static io.airlift.compress.UnsafeUtil.UNSAFE;
 import static io.airlift.compress.zstd.BitInputStream.isEndOfStream;
 import static io.airlift.compress.zstd.BitInputStream.peekBitsFast;
 import static io.airlift.compress.zstd.Constants.SIZE_OF_INT;
+import static io.airlift.compress.zstd.Constants.SIZE_OF_LONG;
 import static io.airlift.compress.zstd.Constants.SIZE_OF_SHORT;
 import static io.airlift.compress.zstd.Util.isPowerOf2;
 import static io.airlift.compress.zstd.Util.verify;
@@ -38,8 +40,8 @@ class Huffman
 
     // table
     private int tableLog = -1;
-    private final byte[] symbols = new byte[1 << MAX_TABLE_LOG];
-    private final byte[] numbersOfBits = new byte[1 << MAX_TABLE_LOG];
+    // symbol | numberOfBits << 8: one load per decoded symbol instead of two
+    private final short[] entries = new short[1 << MAX_TABLE_LOG];
 
     private final FseTableReader reader = new FseTableReader();
     private final FiniteStateEntropy.Table fseTable = new FiniteStateEntropy.Table(MAX_FSE_TABLE_LOG);
@@ -113,11 +115,9 @@ class Huffman
             int weight = weights[n];
             int length = (1 << weight) >> 1;  // TODO: 1 << (weight - 1) ??
 
-            byte symbol = (byte) n;
-            byte numberOfBits = (byte) (tableLog + 1 - weight);
+            short entry = (short) (n | (tableLog + 1 - weight) << 8);
             for (int i = ranks[weight]; i < ranks[weight] + length; i++) {
-                symbols[i] = symbol;
-                numbersOfBits[i] = numberOfBits;
+                entries[i] = entry;
             }
             ranks[weight] += length;
         }
@@ -129,47 +129,48 @@ class Huffman
 
     public void decodeSingleStream(final Object inputBase, final long inputAddress, final long inputLimit, final Object outputBase, final long outputAddress, final long outputLimit)
     {
-        long[] scratch = new long[2]; // one per call; refills below are allocation-free (see BitInputStream)
+        final boolean split = SPLIT_LONGS;
+        long[] scratch = new long[2]; // one per call; only the cold refill path below uses it
         int bitsConsumed = BitInputStream.initializeBits(inputBase, inputAddress, inputLimit, scratch);
         long bits = scratch[0];
         long currentAddress = scratch[1];
 
         int tableLog = this.tableLog;
-        byte[] numbersOfBits = this.numbersOfBits;
-        byte[] symbols = this.symbols;
+        short[] entries = this.entries;
 
         // 4 symbols at a time
         long output = outputAddress;
         long fastOutputLimit = outputLimit - 4;
         while (output < fastOutputLimit) {
-            int loaded = BitInputStream.loadBits(inputBase, inputAddress, currentAddress, bits, bitsConsumed, scratch);
-            bits = scratch[0];
-            currentAddress = scratch[1];
-            bitsConsumed = loaded & BitInputStream.LOAD_BITS_CONSUMED_MASK;
-            if ((loaded & BitInputStream.LOAD_DONE) != 0) {
-                break;
+            // ARM/ART: BitInputStream.loadBits is too big for ART to inline; its common case
+            // (>= 8 bytes left) is done here, the rest still goes through the call
+            if (currentAddress >= inputAddress + SIZE_OF_LONG) {
+                currentAddress -= bitsConsumed >>> 3;
+                bits = (split ? ((UNSAFE.getInt(inputBase, currentAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, currentAddress + 4) << 32)) : UNSAFE.getLong(inputBase, currentAddress));
+                bitsConsumed &= 0b111;
+            }
+            else {
+                int loaded = BitInputStream.loadBits(inputBase, inputAddress, currentAddress, bits, bitsConsumed, scratch);
+                bits = scratch[0];
+                currentAddress = scratch[1];
+                bitsConsumed = loaded & BitInputStream.LOAD_BITS_CONSUMED_MASK;
+                if ((loaded & BitInputStream.LOAD_DONE) != 0) {
+                    break;
+                }
             }
 
-            {
-                int index = (int) peekBitsFast(bitsConsumed, bits, tableLog);
-                UNSAFE.putByte(outputBase, output, symbols[index]);
-                bitsConsumed += numbersOfBits[index];
-            }
-            {
-                int index = (int) peekBitsFast(bitsConsumed, bits, tableLog);
-                UNSAFE.putByte(outputBase, output + 1, symbols[index]);
-                bitsConsumed += numbersOfBits[index];
-            }
-            {
-                int index = (int) peekBitsFast(bitsConsumed, bits, tableLog);
-                UNSAFE.putByte(outputBase, output + 2, symbols[index]);
-                bitsConsumed += numbersOfBits[index];
-            }
-            {
-                int index = (int) peekBitsFast(bitsConsumed, bits, tableLog);
-                UNSAFE.putByte(outputBase, output + 3, symbols[index]);
-                bitsConsumed += numbersOfBits[index];
-            }
+            // ARM/ART: entry = symbol | numberOfBits << 8 (one table load per symbol); the 4
+            // symbols are collected in a register and written with one putInt - putByte is a JNI
+            // call on ART builds that don't intrinsify it (pre-Android 15 ART module)
+            int e0 = entries[(int) peekBitsFast(bitsConsumed, bits, tableLog)];
+            bitsConsumed += e0 >>> 8;
+            int e1 = entries[(int) peekBitsFast(bitsConsumed, bits, tableLog)];
+            bitsConsumed += e1 >>> 8;
+            int e2 = entries[(int) peekBitsFast(bitsConsumed, bits, tableLog)];
+            bitsConsumed += e2 >>> 8;
+            int e3 = entries[(int) peekBitsFast(bitsConsumed, bits, tableLog)];
+            bitsConsumed += e3 >>> 8;
+            UNSAFE.putInt(outputBase, output, (e0 & 0xFF) | (e1 & 0xFF) << 8 | (e2 & 0xFF) << 16 | e3 << 24);
             output += SIZE_OF_INT;
         }
 
@@ -178,6 +179,7 @@ class Huffman
 
     public void decode4Streams(final Object inputBase, final long inputAddress, final long inputLimit, final Object outputBase, final long outputAddress, final long outputLimit)
     {
+        final boolean split = SPLIT_LONGS;
         verify(inputLimit - inputAddress >= 10, inputAddress, "Input is corrupted"); // jump table + 1 byte per stream
 
         long start1 = inputAddress + 3 * SIZE_OF_SHORT; // for the shorts we read below
@@ -187,7 +189,7 @@ class Huffman
 
         verify(start2 < start3 && start3 < start4 && start4 < inputLimit, inputAddress, "Input is corrupted");
 
-        long[] scratch = new long[2]; // one per call; refills below are allocation-free (see BitInputStream)
+        long[] scratch = new long[2]; // one per call; only the cold refill paths below use it
         int stream1bitsConsumed = BitInputStream.initializeBits(inputBase, start1, start2, scratch);
         long stream1bits = scratch[0];
         long stream1currentAddress = scratch[1];
@@ -215,132 +217,135 @@ class Huffman
         long output3 = outputStart3;
         long output4 = outputStart4;
 
-        // decodeSymbol() is inlined at every call site below: it was one call per decoded byte.
         long fastOutputLimit = outputLimit - 7;
         int tableLog = this.tableLog;
-        byte[] numbersOfBits = this.numbersOfBits;
-        byte[] symbols = this.symbols;
+        short[] entries = this.entries;
 
         while (output4 < fastOutputLimit) {
-            {
-                int index = (int) peekBitsFast(stream1bitsConsumed, stream1bits, tableLog);
-                UNSAFE.putByte(outputBase, output1, symbols[index]);
-                stream1bitsConsumed += numbersOfBits[index];
-            }
-            {
-                int index = (int) peekBitsFast(stream2bitsConsumed, stream2bits, tableLog);
-                UNSAFE.putByte(outputBase, output2, symbols[index]);
-                stream2bitsConsumed += numbersOfBits[index];
-            }
-            {
-                int index = (int) peekBitsFast(stream3bitsConsumed, stream3bits, tableLog);
-                UNSAFE.putByte(outputBase, output3, symbols[index]);
-                stream3bitsConsumed += numbersOfBits[index];
-            }
-            {
-                int index = (int) peekBitsFast(stream4bitsConsumed, stream4bits, tableLog);
-                UNSAFE.putByte(outputBase, output4, symbols[index]);
-                stream4bitsConsumed += numbersOfBits[index];
-            }
+            // ARM/ART: 4 symbols per stream, each stream's bytes collected in a register and written
+            // with one putInt (see decodeSingleStream); entry = symbol | numberOfBits << 8
+            int e;
+            e = entries[(int) peekBitsFast(stream1bitsConsumed, stream1bits, tableLog)];
+            stream1bitsConsumed += e >>> 8;
+            int out1 = e & 0xFF;
+            e = entries[(int) peekBitsFast(stream2bitsConsumed, stream2bits, tableLog)];
+            stream2bitsConsumed += e >>> 8;
+            int out2 = e & 0xFF;
+            e = entries[(int) peekBitsFast(stream3bitsConsumed, stream3bits, tableLog)];
+            stream3bitsConsumed += e >>> 8;
+            int out3 = e & 0xFF;
+            e = entries[(int) peekBitsFast(stream4bitsConsumed, stream4bits, tableLog)];
+            stream4bitsConsumed += e >>> 8;
+            int out4 = e & 0xFF;
 
-            {
-                int index = (int) peekBitsFast(stream1bitsConsumed, stream1bits, tableLog);
-                UNSAFE.putByte(outputBase, output1 + 1, symbols[index]);
-                stream1bitsConsumed += numbersOfBits[index];
-            }
-            {
-                int index = (int) peekBitsFast(stream2bitsConsumed, stream2bits, tableLog);
-                UNSAFE.putByte(outputBase, output2 + 1, symbols[index]);
-                stream2bitsConsumed += numbersOfBits[index];
-            }
-            {
-                int index = (int) peekBitsFast(stream3bitsConsumed, stream3bits, tableLog);
-                UNSAFE.putByte(outputBase, output3 + 1, symbols[index]);
-                stream3bitsConsumed += numbersOfBits[index];
-            }
-            {
-                int index = (int) peekBitsFast(stream4bitsConsumed, stream4bits, tableLog);
-                UNSAFE.putByte(outputBase, output4 + 1, symbols[index]);
-                stream4bitsConsumed += numbersOfBits[index];
-            }
+            e = entries[(int) peekBitsFast(stream1bitsConsumed, stream1bits, tableLog)];
+            stream1bitsConsumed += e >>> 8;
+            out1 |= (e & 0xFF) << 8;
+            e = entries[(int) peekBitsFast(stream2bitsConsumed, stream2bits, tableLog)];
+            stream2bitsConsumed += e >>> 8;
+            out2 |= (e & 0xFF) << 8;
+            e = entries[(int) peekBitsFast(stream3bitsConsumed, stream3bits, tableLog)];
+            stream3bitsConsumed += e >>> 8;
+            out3 |= (e & 0xFF) << 8;
+            e = entries[(int) peekBitsFast(stream4bitsConsumed, stream4bits, tableLog)];
+            stream4bitsConsumed += e >>> 8;
+            out4 |= (e & 0xFF) << 8;
 
-            {
-                int index = (int) peekBitsFast(stream1bitsConsumed, stream1bits, tableLog);
-                UNSAFE.putByte(outputBase, output1 + 2, symbols[index]);
-                stream1bitsConsumed += numbersOfBits[index];
-            }
-            {
-                int index = (int) peekBitsFast(stream2bitsConsumed, stream2bits, tableLog);
-                UNSAFE.putByte(outputBase, output2 + 2, symbols[index]);
-                stream2bitsConsumed += numbersOfBits[index];
-            }
-            {
-                int index = (int) peekBitsFast(stream3bitsConsumed, stream3bits, tableLog);
-                UNSAFE.putByte(outputBase, output3 + 2, symbols[index]);
-                stream3bitsConsumed += numbersOfBits[index];
-            }
-            {
-                int index = (int) peekBitsFast(stream4bitsConsumed, stream4bits, tableLog);
-                UNSAFE.putByte(outputBase, output4 + 2, symbols[index]);
-                stream4bitsConsumed += numbersOfBits[index];
-            }
+            e = entries[(int) peekBitsFast(stream1bitsConsumed, stream1bits, tableLog)];
+            stream1bitsConsumed += e >>> 8;
+            out1 |= (e & 0xFF) << 16;
+            e = entries[(int) peekBitsFast(stream2bitsConsumed, stream2bits, tableLog)];
+            stream2bitsConsumed += e >>> 8;
+            out2 |= (e & 0xFF) << 16;
+            e = entries[(int) peekBitsFast(stream3bitsConsumed, stream3bits, tableLog)];
+            stream3bitsConsumed += e >>> 8;
+            out3 |= (e & 0xFF) << 16;
+            e = entries[(int) peekBitsFast(stream4bitsConsumed, stream4bits, tableLog)];
+            stream4bitsConsumed += e >>> 8;
+            out4 |= (e & 0xFF) << 16;
 
-            {
-                int index = (int) peekBitsFast(stream1bitsConsumed, stream1bits, tableLog);
-                UNSAFE.putByte(outputBase, output1 + 3, symbols[index]);
-                stream1bitsConsumed += numbersOfBits[index];
-            }
-            {
-                int index = (int) peekBitsFast(stream2bitsConsumed, stream2bits, tableLog);
-                UNSAFE.putByte(outputBase, output2 + 3, symbols[index]);
-                stream2bitsConsumed += numbersOfBits[index];
-            }
-            {
-                int index = (int) peekBitsFast(stream3bitsConsumed, stream3bits, tableLog);
-                UNSAFE.putByte(outputBase, output3 + 3, symbols[index]);
-                stream3bitsConsumed += numbersOfBits[index];
-            }
-            {
-                int index = (int) peekBitsFast(stream4bitsConsumed, stream4bits, tableLog);
-                UNSAFE.putByte(outputBase, output4 + 3, symbols[index]);
-                stream4bitsConsumed += numbersOfBits[index];
-            }
+            e = entries[(int) peekBitsFast(stream1bitsConsumed, stream1bits, tableLog)];
+            stream1bitsConsumed += e >>> 8;
+            out1 |= e << 24;
+            e = entries[(int) peekBitsFast(stream2bitsConsumed, stream2bits, tableLog)];
+            stream2bitsConsumed += e >>> 8;
+            out2 |= e << 24;
+            e = entries[(int) peekBitsFast(stream3bitsConsumed, stream3bits, tableLog)];
+            stream3bitsConsumed += e >>> 8;
+            out3 |= e << 24;
+            e = entries[(int) peekBitsFast(stream4bitsConsumed, stream4bits, tableLog)];
+            stream4bitsConsumed += e >>> 8;
+            out4 |= e << 24;
+
+            UNSAFE.putInt(outputBase, output1, out1);
+            UNSAFE.putInt(outputBase, output2, out2);
+            UNSAFE.putInt(outputBase, output3, out3);
+            UNSAFE.putInt(outputBase, output4, out4);
 
             output1 += SIZE_OF_INT;
             output2 += SIZE_OF_INT;
             output3 += SIZE_OF_INT;
             output4 += SIZE_OF_INT;
 
-            int loaded = BitInputStream.loadBits(inputBase, start1, stream1currentAddress, stream1bits, stream1bitsConsumed, scratch);
-            stream1bits = scratch[0];
-            stream1currentAddress = scratch[1];
-            stream1bitsConsumed = loaded & BitInputStream.LOAD_BITS_CONSUMED_MASK;
-            if ((loaded & BitInputStream.LOAD_DONE) != 0) {
-                break;
+            // ARM/ART: common case of BitInputStream.loadBits inlined per stream (see decodeSingleStream)
+            if (stream1currentAddress >= start1 + SIZE_OF_LONG) {
+                stream1currentAddress -= stream1bitsConsumed >>> 3;
+                stream1bits = (split ? ((UNSAFE.getInt(inputBase, stream1currentAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, stream1currentAddress + 4) << 32)) : UNSAFE.getLong(inputBase, stream1currentAddress));
+                stream1bitsConsumed &= 0b111;
+            }
+            else {
+                int loaded = BitInputStream.loadBits(inputBase, start1, stream1currentAddress, stream1bits, stream1bitsConsumed, scratch);
+                stream1bits = scratch[0];
+                stream1currentAddress = scratch[1];
+                stream1bitsConsumed = loaded & BitInputStream.LOAD_BITS_CONSUMED_MASK;
+                if ((loaded & BitInputStream.LOAD_DONE) != 0) {
+                    break;
+                }
             }
 
-            loaded = BitInputStream.loadBits(inputBase, start2, stream2currentAddress, stream2bits, stream2bitsConsumed, scratch);
-            stream2bits = scratch[0];
-            stream2currentAddress = scratch[1];
-            stream2bitsConsumed = loaded & BitInputStream.LOAD_BITS_CONSUMED_MASK;
-            if ((loaded & BitInputStream.LOAD_DONE) != 0) {
-                break;
+            if (stream2currentAddress >= start2 + SIZE_OF_LONG) {
+                stream2currentAddress -= stream2bitsConsumed >>> 3;
+                stream2bits = (split ? ((UNSAFE.getInt(inputBase, stream2currentAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, stream2currentAddress + 4) << 32)) : UNSAFE.getLong(inputBase, stream2currentAddress));
+                stream2bitsConsumed &= 0b111;
+            }
+            else {
+                int loaded = BitInputStream.loadBits(inputBase, start2, stream2currentAddress, stream2bits, stream2bitsConsumed, scratch);
+                stream2bits = scratch[0];
+                stream2currentAddress = scratch[1];
+                stream2bitsConsumed = loaded & BitInputStream.LOAD_BITS_CONSUMED_MASK;
+                if ((loaded & BitInputStream.LOAD_DONE) != 0) {
+                    break;
+                }
             }
 
-            loaded = BitInputStream.loadBits(inputBase, start3, stream3currentAddress, stream3bits, stream3bitsConsumed, scratch);
-            stream3bits = scratch[0];
-            stream3currentAddress = scratch[1];
-            stream3bitsConsumed = loaded & BitInputStream.LOAD_BITS_CONSUMED_MASK;
-            if ((loaded & BitInputStream.LOAD_DONE) != 0) {
-                break;
+            if (stream3currentAddress >= start3 + SIZE_OF_LONG) {
+                stream3currentAddress -= stream3bitsConsumed >>> 3;
+                stream3bits = (split ? ((UNSAFE.getInt(inputBase, stream3currentAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, stream3currentAddress + 4) << 32)) : UNSAFE.getLong(inputBase, stream3currentAddress));
+                stream3bitsConsumed &= 0b111;
+            }
+            else {
+                int loaded = BitInputStream.loadBits(inputBase, start3, stream3currentAddress, stream3bits, stream3bitsConsumed, scratch);
+                stream3bits = scratch[0];
+                stream3currentAddress = scratch[1];
+                stream3bitsConsumed = loaded & BitInputStream.LOAD_BITS_CONSUMED_MASK;
+                if ((loaded & BitInputStream.LOAD_DONE) != 0) {
+                    break;
+                }
             }
 
-            loaded = BitInputStream.loadBits(inputBase, start4, stream4currentAddress, stream4bits, stream4bitsConsumed, scratch);
-            stream4bits = scratch[0];
-            stream4currentAddress = scratch[1];
-            stream4bitsConsumed = loaded & BitInputStream.LOAD_BITS_CONSUMED_MASK;
-            if ((loaded & BitInputStream.LOAD_DONE) != 0) {
-                break;
+            if (stream4currentAddress >= start4 + SIZE_OF_LONG) {
+                stream4currentAddress -= stream4bitsConsumed >>> 3;
+                stream4bits = (split ? ((UNSAFE.getInt(inputBase, stream4currentAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, stream4currentAddress + 4) << 32)) : UNSAFE.getLong(inputBase, stream4currentAddress));
+                stream4bitsConsumed &= 0b111;
+            }
+            else {
+                int loaded = BitInputStream.loadBits(inputBase, start4, stream4currentAddress, stream4bits, stream4bitsConsumed, scratch);
+                stream4bits = scratch[0];
+                stream4currentAddress = scratch[1];
+                stream4bitsConsumed = loaded & BitInputStream.LOAD_BITS_CONSUMED_MASK;
+                if ((loaded & BitInputStream.LOAD_DONE) != 0) {
+                    break;
+                }
             }
         }
 
@@ -357,8 +362,7 @@ class Huffman
     {
         long[] scratch = new long[2]; // one per call; refills below are allocation-free
         int tableLog = this.tableLog;
-        byte[] numbersOfBits = this.numbersOfBits;
-        byte[] symbols = this.symbols;
+        short[] entries = this.entries;
 
         // closer to the end
         while (outputAddress < outputLimit) {
@@ -370,30 +374,18 @@ class Huffman
                 break;
             }
 
-            {
-                int index = (int) peekBitsFast(bitsConsumed, bits, tableLog);
-                UNSAFE.putByte(outputBase, outputAddress++, symbols[index]);
-                bitsConsumed += numbersOfBits[index];
-            }
+            int e = entries[(int) peekBitsFast(bitsConsumed, bits, tableLog)];
+            UNSAFE.putByte(outputBase, outputAddress++, (byte) e);
+            bitsConsumed += e >>> 8;
         }
 
         // not more data in bit stream, so no need to reload
         while (outputAddress < outputLimit) {
-            {
-                int index = (int) peekBitsFast(bitsConsumed, bits, tableLog);
-                UNSAFE.putByte(outputBase, outputAddress++, symbols[index]);
-                bitsConsumed += numbersOfBits[index];
-            }
+            int e = entries[(int) peekBitsFast(bitsConsumed, bits, tableLog)];
+            UNSAFE.putByte(outputBase, outputAddress++, (byte) e);
+            bitsConsumed += e >>> 8;
         }
 
         verify(isEndOfStream(startAddress, currentAddress, bitsConsumed), startAddress, "Bit stream is not fully consumed");
     }
-
-    // NOW REPLACED WITH INLINED CODE
-    //private static int decodeSymbol(Object outputBase, long outputAddress, long bitContainer, int bitsConsumed, int tableLog, byte[] numbersOfBits, byte[] symbols)
-    //{
-    //    int value = (int) peekBitsFast(bitsConsumed, bitContainer, tableLog);
-    //    UNSAFE.putByte(outputBase, outputAddress, symbols[value]);
-    //    return bitsConsumed + numbersOfBits[value];
-    //}
 }

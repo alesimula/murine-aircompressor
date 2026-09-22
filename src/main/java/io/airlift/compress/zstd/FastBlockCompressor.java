@@ -146,11 +146,31 @@ class FastBlockCompressor
         else {
             matchLength = DoubleFastBlockCompressor.count(inputBase, input + SIZE_OF_INT, inputEnd, matchAddress + SIZE_OF_INT) + SIZE_OF_INT;
             offset = (int) (input - matchAddress);
-            while (input > anchor && matchAddress > windowBaseAddress && UNSAFE.getByte(inputBase, input - 1) == UNSAFE.getByte(inputBase, matchAddress - 1)) {
-                input--;
-                matchAddress--;
-                matchLength++;
+            // ---- begin inlined extendBackward (backward match extension, "catch up") ----
+            // ARM/ART: 8 bytes per compare instead of two getByte per byte (JNI calls on ART builds that
+            // don't intrinsify them); the byte loop handles the last < 8 bytes before anchor / window start.
+            // Same result as the original byte-at-a-time loop.
+            catchUp:
+            {
+                while (input - SIZE_OF_LONG >= anchor && matchAddress - SIZE_OF_LONG >= windowBaseAddress) {
+                    long diff = (split ? ((UNSAFE.getInt(inputBase, (input - SIZE_OF_LONG)) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, (input - SIZE_OF_LONG) + 4) << 32)) : UNSAFE.getLong(inputBase, (input - SIZE_OF_LONG))) ^ (split ? ((UNSAFE.getInt(inputBase, (matchAddress - SIZE_OF_LONG)) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, (matchAddress - SIZE_OF_LONG) + 4) << 32)) : UNSAFE.getLong(inputBase, (matchAddress - SIZE_OF_LONG)));
+                    if (diff != 0) {
+                        int equalBytes = Long.numberOfLeadingZeros(diff) >>> 3;
+                        input -= equalBytes;
+                        matchLength += equalBytes;
+                        break catchUp;
+                    }
+                    input -= SIZE_OF_LONG;
+                    matchAddress -= SIZE_OF_LONG;
+                    matchLength += SIZE_OF_LONG;
+                }
+                while (input > anchor && matchAddress > windowBaseAddress && UNSAFE.getByte(inputBase, input - 1) == UNSAFE.getByte(inputBase, matchAddress - 1)) {
+                    input--;
+                    matchAddress--;
+                    matchLength++;
+                }
             }
+            // ---- end inlined extendBackward ----
             offset2 = offset1;
             offset1 = offset;
             output.storeSequence(inputBase, anchor, (int) (input - anchor), offset + REP_MOVE, matchLength - MIN_MATCH);

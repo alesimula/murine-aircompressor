@@ -237,11 +237,31 @@ class DoubleFastBlockCompressor
                 // prefix long match
                 matchLength = count(inputBase, input + SIZE_OF_LONG, inputEnd, longMatchAddress + SIZE_OF_LONG) + SIZE_OF_LONG;
                 offset = (int) (input - longMatchAddress);
-                while (input > anchor && longMatchAddress > windowBaseAddress && UNSAFE.getByte(inputBase, input - 1) == UNSAFE.getByte(inputBase, longMatchAddress - 1)) {
-                    input--;
-                    longMatchAddress--;
-                    matchLength++;
+                // ---- begin inlined extendBackward (backward match extension, "catch up") ----
+                // ARM/ART: 8 bytes per compare instead of two getByte per byte (JNI calls on ART builds that
+                // don't intrinsify them); the byte loop handles the last < 8 bytes before anchor / window start.
+                // Same result as the original byte-at-a-time loop.
+                catchUp:
+                {
+                    while (input - SIZE_OF_LONG >= anchor && longMatchAddress - SIZE_OF_LONG >= windowBaseAddress) {
+                        long diff = (split ? ((UNSAFE.getInt(inputBase, (input - SIZE_OF_LONG)) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, (input - SIZE_OF_LONG) + 4) << 32)) : UNSAFE.getLong(inputBase, (input - SIZE_OF_LONG))) ^ (split ? ((UNSAFE.getInt(inputBase, (longMatchAddress - SIZE_OF_LONG)) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, (longMatchAddress - SIZE_OF_LONG) + 4) << 32)) : UNSAFE.getLong(inputBase, (longMatchAddress - SIZE_OF_LONG)));
+                        if (diff != 0) {
+                            int equalBytes = Long.numberOfLeadingZeros(diff) >>> 3;
+                            input -= equalBytes;
+                            matchLength += equalBytes;
+                            break catchUp;
+                        }
+                        input -= SIZE_OF_LONG;
+                        longMatchAddress -= SIZE_OF_LONG;
+                        matchLength += SIZE_OF_LONG;
+                    }
+                    while (input > anchor && longMatchAddress > windowBaseAddress && UNSAFE.getByte(inputBase, input - 1) == UNSAFE.getByte(inputBase, longMatchAddress - 1)) {
+                        input--;
+                        longMatchAddress--;
+                        matchLength++;
+                    }
                 }
+                // ---- end inlined extendBackward ----
             }
             else {
                 // prefix short match
@@ -254,21 +274,61 @@ class DoubleFastBlockCompressor
                     matchLength = count(inputBase, input + 1 + SIZE_OF_LONG, inputEnd, nextOffsetMatchAddress + SIZE_OF_LONG) + SIZE_OF_LONG;
                     input++;
                     offset = (int) (input - nextOffsetMatchAddress);
-                    while (input > anchor && nextOffsetMatchAddress > windowBaseAddress && UNSAFE.getByte(inputBase, input - 1) == UNSAFE.getByte(inputBase, nextOffsetMatchAddress - 1)) {
-                        input--;
-                        nextOffsetMatchAddress--;
-                        matchLength++;
+                    // ---- begin inlined extendBackward (backward match extension, "catch up") ----
+                    // ARM/ART: 8 bytes per compare instead of two getByte per byte (JNI calls on ART builds that
+                    // don't intrinsify them); the byte loop handles the last < 8 bytes before anchor / window start.
+                    // Same result as the original byte-at-a-time loop.
+                    catchUp:
+                    {
+                        while (input - SIZE_OF_LONG >= anchor && nextOffsetMatchAddress - SIZE_OF_LONG >= windowBaseAddress) {
+                            long diff = (split ? ((UNSAFE.getInt(inputBase, (input - SIZE_OF_LONG)) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, (input - SIZE_OF_LONG) + 4) << 32)) : UNSAFE.getLong(inputBase, (input - SIZE_OF_LONG))) ^ (split ? ((UNSAFE.getInt(inputBase, (nextOffsetMatchAddress - SIZE_OF_LONG)) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, (nextOffsetMatchAddress - SIZE_OF_LONG) + 4) << 32)) : UNSAFE.getLong(inputBase, (nextOffsetMatchAddress - SIZE_OF_LONG)));
+                            if (diff != 0) {
+                                int equalBytes = Long.numberOfLeadingZeros(diff) >>> 3;
+                                input -= equalBytes;
+                                matchLength += equalBytes;
+                                break catchUp;
+                            }
+                            input -= SIZE_OF_LONG;
+                            nextOffsetMatchAddress -= SIZE_OF_LONG;
+                            matchLength += SIZE_OF_LONG;
+                        }
+                        while (input > anchor && nextOffsetMatchAddress > windowBaseAddress && UNSAFE.getByte(inputBase, input - 1) == UNSAFE.getByte(inputBase, nextOffsetMatchAddress - 1)) {
+                            input--;
+                            nextOffsetMatchAddress--;
+                            matchLength++;
+                        }
                     }
+                    // ---- end inlined extendBackward ----
                 }
                 else {
                     // if no long +1 match, explore the short match we found
                     matchLength = count(inputBase, input + SIZE_OF_INT, inputEnd, shortMatchAddress + SIZE_OF_INT) + SIZE_OF_INT;
                     offset = (int) (input - shortMatchAddress);
-                    while (input > anchor && shortMatchAddress > windowBaseAddress && UNSAFE.getByte(inputBase, input - 1) == UNSAFE.getByte(inputBase, shortMatchAddress - 1)) {
-                        input--;
-                        shortMatchAddress--;
-                        matchLength++;
+                    // ---- begin inlined extendBackward (backward match extension, "catch up") ----
+                    // ARM/ART: 8 bytes per compare instead of two getByte per byte (JNI calls on ART builds that
+                    // don't intrinsify them); the byte loop handles the last < 8 bytes before anchor / window start.
+                    // Same result as the original byte-at-a-time loop.
+                    catchUp:
+                    {
+                        while (input - SIZE_OF_LONG >= anchor && shortMatchAddress - SIZE_OF_LONG >= windowBaseAddress) {
+                            long diff = (split ? ((UNSAFE.getInt(inputBase, (input - SIZE_OF_LONG)) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, (input - SIZE_OF_LONG) + 4) << 32)) : UNSAFE.getLong(inputBase, (input - SIZE_OF_LONG))) ^ (split ? ((UNSAFE.getInt(inputBase, (shortMatchAddress - SIZE_OF_LONG)) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, (shortMatchAddress - SIZE_OF_LONG) + 4) << 32)) : UNSAFE.getLong(inputBase, (shortMatchAddress - SIZE_OF_LONG)));
+                            if (diff != 0) {
+                                int equalBytes = Long.numberOfLeadingZeros(diff) >>> 3;
+                                input -= equalBytes;
+                                matchLength += equalBytes;
+                                break catchUp;
+                            }
+                            input -= SIZE_OF_LONG;
+                            shortMatchAddress -= SIZE_OF_LONG;
+                            matchLength += SIZE_OF_LONG;
+                        }
+                        while (input > anchor && shortMatchAddress > windowBaseAddress && UNSAFE.getByte(inputBase, input - 1) == UNSAFE.getByte(inputBase, shortMatchAddress - 1)) {
+                            input--;
+                            shortMatchAddress--;
+                            matchLength++;
+                        }
                     }
+                    // ---- end inlined extendBackward ----
                 }
             }
 

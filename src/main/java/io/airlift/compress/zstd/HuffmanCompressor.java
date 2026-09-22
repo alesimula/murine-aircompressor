@@ -141,16 +141,19 @@ class HuffmanCompressor
         }
 
         for (; n > 0; n -= 4) {  // note: n & 3 == 0 at this stage
-            symbol = UNSAFE.getByte(inputBase, input + n - 1) & 0xFF;
+            // ARM/ART: one getInt for the 4 symbols (little endian: byte n-1 is the top byte);
+            // getByte is a JNI call on ART builds that don't intrinsify it
+            int four = UNSAFE.getInt(inputBase, input + n - 4);
+            symbol = four >>> 24;
             container |= ((long) symbolValues[symbol]) << bitCount;
             bitCount += symbolBits[symbol];
-            symbol = UNSAFE.getByte(inputBase, input + n - 2) & 0xFF;
+            symbol = (four >>> 16) & 0xFF;
             container |= ((long) symbolValues[symbol]) << bitCount;
             bitCount += symbolBits[symbol];
-            symbol = UNSAFE.getByte(inputBase, input + n - 3) & 0xFF;
+            symbol = (four >>> 8) & 0xFF;
             container |= ((long) symbolValues[symbol]) << bitCount;
             bitCount += symbolBits[symbol];
-            symbol = UNSAFE.getByte(inputBase, input + n - 4) & 0xFF;
+            symbol = four & 0xFF;
             container |= ((long) symbolValues[symbol]) << bitCount;
             bitCount += symbolBits[symbol];
             // flush
