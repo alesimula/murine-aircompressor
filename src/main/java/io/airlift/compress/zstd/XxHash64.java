@@ -134,6 +134,12 @@ final class XxHash64
     private int updateBody(Object base, long address, int length)
     {
         final boolean split = SPLIT_LONGS;
+        // ARM/ART: accumulators in locals - with the fields, every Unsafe read (which ART treats as
+        // having all side effects) forced v1..v4 to be stored and reloaded on each 32-byte step
+        long v1 = this.v1;
+        long v2 = this.v2;
+        long v3 = this.v3;
+        long v4 = this.v4;
         int remaining = length;
         while (remaining >= 32) {
             v1 = mix(v1, (split ? ((UNSAFE.getInt(base, address) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(base, address + 4) << 32)) : UNSAFE.getLong(base, address)));
@@ -144,6 +150,11 @@ final class XxHash64
             address += 32;
             remaining -= 32;
         }
+
+        this.v1 = v1;
+        this.v2 = v2;
+        this.v3 = v3;
+        this.v4 = v4;
 
         int index = length - remaining;
         bodyLength += index;
