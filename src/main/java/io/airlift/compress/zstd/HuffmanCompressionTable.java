@@ -29,6 +29,9 @@ final class HuffmanCompressionTable
     // ARM/ART: package-private so HuffmanCompressor can hoist these into locals (see SequenceEncoder)
     final short[] values;
     final byte[] numberOfBits;
+    // ARM/ART: value | numberOfBits << 16 per symbol, so HuffmanCompressor does one array read (and
+    // one bounds check) per literal instead of two. Written wherever values/numberOfBits change.
+    final int[] entries;
 
     private int maxSymbol;
     private int maxNumberOfBits;
@@ -37,6 +40,7 @@ final class HuffmanCompressionTable
     {
         this.values = new short[capacity];
         this.numberOfBits = new byte[capacity];
+        this.entries = new int[capacity];
     }
 
     public static int optimalNumberOfBits(int maxNumberOfBits, int inputSize, int maxSymbol)
@@ -97,6 +101,10 @@ final class HuffmanCompressionTable
 
         for (int n = 0; n <= maxSymbol; n++) {
             values[n] = valuesPerRank[numberOfBits[n]]++; // assign value within rank, symbol order
+        }
+
+        for (int n = 0; n <= maxSymbol; n++) {
+            entries[n] = (values[n] & 0xFFFF) | numberOfBits[n] << 16;
         }
 
         this.maxSymbol = maxSymbol;

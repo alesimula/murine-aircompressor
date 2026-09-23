@@ -92,8 +92,8 @@ class HuffmanCompressor
         // ARM/ART: Highly optimized, flattened version of SequenceEncoder.encodeSequences.
         // By moving the Huffman tables and bit container into local variables, it eliminates object-field
         // loads and method calls, generating bit-identical output with maximum performance on ARM/ART.
-        final short[] symbolValues = table.values;
-        final byte[] symbolBits = table.numberOfBits;
+        // ARM/ART: entry = value | numberOfBits << 16 (one read + bounds check per literal)
+        final int[] entries = table.entries;
         final long bosLimit = outputAddress + outputSize - SIZE_OF_LONG;
         long container = 0;
         int bitCount = 0;
@@ -102,23 +102,27 @@ class HuffmanCompressor
 
         int n = inputSize & ~3; // join to mod 4
         int symbol;
+        int entry;
         int flushedBytes;
 
         switch (inputSize & 3) {
             case 3:
                 symbol = UNSAFE.getByte(inputBase, input + n + 2) & 0xFF;
-                container |= ((long) symbolValues[symbol]) << bitCount;
-                bitCount += symbolBits[symbol];
+                entry = entries[symbol];
+                container |= ((long) (entry & 0xFFFF)) << bitCount;
+                bitCount += entry >>> 16;
                 // fall-through
             case 2:
                 symbol = UNSAFE.getByte(inputBase, input + n + 1) & 0xFF;
-                container |= ((long) symbolValues[symbol]) << bitCount;
-                bitCount += symbolBits[symbol];
+                entry = entries[symbol];
+                container |= ((long) (entry & 0xFFFF)) << bitCount;
+                bitCount += entry >>> 16;
                 // fall-through
             case 1:
                 symbol = UNSAFE.getByte(inputBase, input + n + 0) & 0xFF;
-                container |= ((long) symbolValues[symbol]) << bitCount;
-                bitCount += symbolBits[symbol];
+                entry = entries[symbol];
+                container |= ((long) (entry & 0xFFFF)) << bitCount;
+                bitCount += entry >>> 16;
                 // flush
                 flushedBytes = bitCount >>> 3;
                 if (split) {
@@ -145,17 +149,21 @@ class HuffmanCompressor
             // getByte is a JNI call on ART builds that don't intrinsify it
             int four = UNSAFE.getInt(inputBase, input + n - 4);
             symbol = four >>> 24;
-            container |= ((long) symbolValues[symbol]) << bitCount;
-            bitCount += symbolBits[symbol];
+            entry = entries[symbol];
+            container |= ((long) (entry & 0xFFFF)) << bitCount;
+            bitCount += entry >>> 16;
             symbol = (four >>> 16) & 0xFF;
-            container |= ((long) symbolValues[symbol]) << bitCount;
-            bitCount += symbolBits[symbol];
+            entry = entries[symbol];
+            container |= ((long) (entry & 0xFFFF)) << bitCount;
+            bitCount += entry >>> 16;
             symbol = (four >>> 8) & 0xFF;
-            container |= ((long) symbolValues[symbol]) << bitCount;
-            bitCount += symbolBits[symbol];
+            entry = entries[symbol];
+            container |= ((long) (entry & 0xFFFF)) << bitCount;
+            bitCount += entry >>> 16;
             symbol = four & 0xFF;
-            container |= ((long) symbolValues[symbol]) << bitCount;
-            bitCount += symbolBits[symbol];
+            entry = entries[symbol];
+            container |= ((long) (entry & 0xFFFF)) << bitCount;
+            bitCount += entry >>> 16;
             // flush
             flushedBytes = bitCount >>> 3;
             if (split) {
