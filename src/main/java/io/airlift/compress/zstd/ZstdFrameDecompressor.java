@@ -21,7 +21,6 @@ import static io.airlift.compress.UnsafeUtil.ARRAY_BYTE_BASE_OFFSET;
 import static io.airlift.compress.UnsafeUtil.SPLIT_LONGS;
 import static io.airlift.compress.UnsafeUtil.UNSAFE;
 import static io.airlift.compress.UnsafeUtil.copyMemory;
-import static io.airlift.compress.zstd.BitInputStream.peekBits;
 import static io.airlift.compress.zstd.Constants.COMPRESSED_BLOCK;
 import static io.airlift.compress.zstd.Constants.COMPRESSED_LITERALS_BLOCK;
 import static io.airlift.compress.zstd.Constants.DEFAULT_MAX_OFFSET_CODE_SYMBOL;
@@ -325,6 +324,10 @@ class ZstdFrameDecompressor
             final Object literalsBase, final long literalsAddress, final long literalsLimit,
             long outputAbsoluteBaseAddress)
     {
+        // ARM/ART: peekBits / peekBitsFast / verify are written out in this method. ART's inliner stops
+        // inlining into a method once it passes ~1024 IR instructions (kMaximumNumberOfTotalInstructions;
+        // only callees of <= 3 instructions still get inlined), and this method is past that, so each
+        // of them was a real call per decoded sequence / symbol. HotSpot inlined them, hence no x86 gap.
         final boolean split = SPLIT_LONGS;
         final long fastOutputLimit = outputLimit - SIZE_OF_LONG;
         final long fastMatchOutputLimit = fastOutputLimit - SIZE_OF_LONG;
@@ -335,22 +338,30 @@ class ZstdFrameDecompressor
         long literalsInput = literalsAddress;
 
         int size = (int) (inputLimit - inputAddress);
-        verify(size >= MIN_SEQUENCES_SIZE, input, "Not enough input bytes");
+        if (!(size >= MIN_SEQUENCES_SIZE)) {
+            throw fail(input, "Not enough input bytes");
+        }
 
         // decode header
         int sequenceCount = UNSAFE.getByte(inputBase, input++) & 0xFF;
         if (sequenceCount != 0) {
             if (sequenceCount == 255) {
-                verify(input + SIZE_OF_SHORT <= inputLimit, input, "Not enough input bytes");
+                if (!(input + SIZE_OF_SHORT <= inputLimit)) {
+                    throw fail(input, "Not enough input bytes");
+                }
                 sequenceCount = (UNSAFE.getShort(inputBase, input) & 0xFFFF) + LONG_NUMBER_OF_SEQUENCES;
                 input += SIZE_OF_SHORT;
             }
             else if (sequenceCount > 127) {
-                verify(input < inputLimit, input, "Not enough input bytes");
+                if (!(input < inputLimit)) {
+                    throw fail(input, "Not enough input bytes");
+                }
                 sequenceCount = ((sequenceCount - 128) << 8) + (UNSAFE.getByte(inputBase, input++) & 0xFF);
             }
 
-            verify(input + SIZE_OF_INT <= inputLimit, input, "Not enough input bytes");
+            if (!(input + SIZE_OF_INT <= inputLimit)) {
+                throw fail(input, "Not enough input bytes");
+            }
 
             byte type = UNSAFE.getByte(inputBase, input++);
 
@@ -372,13 +383,13 @@ class ZstdFrameDecompressor
             FiniteStateEntropy.Table currentOffsetCodesTable = this.currentOffsetCodesTable;
             FiniteStateEntropy.Table currentMatchLengthTable = this.currentMatchLengthTable;
 
-            int literalsLengthState = (int) peekBits(bitsConsumed, bits, currentLiteralsLengthTable.log2Size);
+            int literalsLengthState = (int) (((bits << bitsConsumed) >>> 1) >>> (63 - currentLiteralsLengthTable.log2Size));
             bitsConsumed += currentLiteralsLengthTable.log2Size;
 
-            int offsetCodesState = (int) peekBits(bitsConsumed, bits, currentOffsetCodesTable.log2Size);
+            int offsetCodesState = (int) (((bits << bitsConsumed) >>> 1) >>> (63 - currentOffsetCodesTable.log2Size));
             bitsConsumed += currentOffsetCodesTable.log2Size;
 
-            int matchLengthState = (int) peekBits(bitsConsumed, bits, currentMatchLengthTable.log2Size);
+            int matchLengthState = (int) (((bits << bitsConsumed) >>> 1) >>> (63 - currentMatchLengthTable.log2Size));
             bitsConsumed += currentMatchLengthTable.log2Size;
 
             // ARM/ART: hoist the static code tables - a static array access is a barriered
@@ -418,7 +429,9 @@ class ZstdFrameDecompressor
                 // registers. Logic is identical to loadBits; LOAD_DONE was never read by this
                 // caller, and the overflow case breaks out before any state is used.
                 if (bitsConsumed > 64) {
-                    verify(sequenceCount == 0, input, "Not all sequences were consumed");
+                    if (!(sequenceCount == 0)) {
+                        throw fail(input, "Not all sequences were consumed");
+                    }
                     break;
                 }
                 if (currentAddress != input) {
@@ -454,7 +467,7 @@ class ZstdFrameDecompressor
 
                 int offset = offsetCodesBaseTable[offsetCode];
                 if (offsetCode > 0) {
-                    offset += peekBits(bitsConsumed, bits, offsetBits);
+                    offset += (((bits << bitsConsumed) >>> 1) >>> (63 - offsetBits));
                     bitsConsumed += offsetBits;
                 }
 
@@ -496,13 +509,13 @@ class ZstdFrameDecompressor
 
                 int matchLength = matchLengthBaseTable[matchLengthCode];
                 if (matchLengthCode > 31) {
-                    matchLength += peekBits(bitsConsumed, bits, matchLengthBits);
+                    matchLength += (((bits << bitsConsumed) >>> 1) >>> (63 - matchLengthBits));
                     bitsConsumed += matchLengthBits;
                 }
 
                 int literalsLength = literalsLengthBaseTable[literalsLengthCode];
                 if (literalsLengthCode > 15) {
-                    literalsLength += peekBits(bitsConsumed, bits, literalsLengthBits);
+                    literalsLength += (((bits << bitsConsumed) >>> 1) >>> (63 - literalsLengthBits));
                     bitsConsumed += literalsLengthBits;
                 }
 
@@ -535,26 +548,32 @@ class ZstdFrameDecompressor
                 int numberOfBits;
 
                 numberOfBits = literalsLengthNumbersOfBits[literalsLengthState];
-                literalsLengthState = (int) (literalsLengthNewStates[literalsLengthState] + peekBits(bitsConsumed, bits, numberOfBits)); // <= 9 bits
+                literalsLengthState = (int) (literalsLengthNewStates[literalsLengthState] + (((bits << bitsConsumed) >>> 1) >>> (63 - numberOfBits))); // <= 9 bits
                 bitsConsumed += numberOfBits;
 
                 numberOfBits = matchLengthNumbersOfBits[matchLengthState];
-                matchLengthState = (int) (matchLengthNewStates[matchLengthState] + peekBits(bitsConsumed, bits, numberOfBits)); // <= 9 bits
+                matchLengthState = (int) (matchLengthNewStates[matchLengthState] + (((bits << bitsConsumed) >>> 1) >>> (63 - numberOfBits))); // <= 9 bits
                 bitsConsumed += numberOfBits;
 
                 numberOfBits = offsetCodesNumbersOfBits[offsetCodesState];
-                offsetCodesState = (int) (offsetCodesNewStates[offsetCodesState] + peekBits(bitsConsumed, bits, numberOfBits)); // <= 8 bits
+                offsetCodesState = (int) (offsetCodesNewStates[offsetCodesState] + (((bits << bitsConsumed) >>> 1) >>> (63 - numberOfBits))); // <= 8 bits
                 bitsConsumed += numberOfBits;
 
                 final long literalOutputLimit = output + literalsLength;
                 final long matchOutputLimit = literalOutputLimit + matchLength;
 
-                verify(matchOutputLimit <= outputLimit, input, "Output buffer too small");
+                if (!(matchOutputLimit <= outputLimit)) {
+                    throw fail(input, "Output buffer too small");
+                }
                 long literalEnd = literalsInput + literalsLength;
-                verify(literalEnd <= literalsLimit, input, "Input is corrupted");
+                if (!(literalEnd <= literalsLimit)) {
+                    throw fail(input, "Input is corrupted");
+                }
 
                 long matchAddress = literalOutputLimit - offset;
-                verify(matchAddress >= outputAbsoluteBaseAddress, input, "Input is corrupted");
+                if (!(matchAddress >= outputAbsoluteBaseAddress)) {
+                    throw fail(input, "Input is corrupted");
+                }
 
                 if (literalOutputLimit > fastOutputLimit) {
                     executeLastSequence(outputBase, output, literalOutputLimit, matchOutputLimit, fastOutputLimit, literalsInput, matchAddress);

@@ -18,10 +18,10 @@ import java.util.Arrays;
 import static io.airlift.compress.UnsafeUtil.SPLIT_LONGS;
 import static io.airlift.compress.UnsafeUtil.UNSAFE;
 import static io.airlift.compress.zstd.BitInputStream.isEndOfStream;
-import static io.airlift.compress.zstd.BitInputStream.peekBitsFast;
 import static io.airlift.compress.zstd.Constants.SIZE_OF_INT;
 import static io.airlift.compress.zstd.Constants.SIZE_OF_LONG;
 import static io.airlift.compress.zstd.Constants.SIZE_OF_SHORT;
+import static io.airlift.compress.zstd.Util.fail;
 import static io.airlift.compress.zstd.Util.isPowerOf2;
 import static io.airlift.compress.zstd.Util.verify;
 
@@ -129,6 +129,10 @@ class Huffman
 
     public void decodeSingleStream(final Object inputBase, final long inputAddress, final long inputLimit, final Object outputBase, final long outputAddress, final long outputLimit)
     {
+        // ARM/ART: peekBits / peekBitsFast / verify are written out in this method. ART's inliner stops
+        // inlining into a method once it passes ~1024 IR instructions (kMaximumNumberOfTotalInstructions;
+        // only callees of <= 3 instructions still get inlined), and this method is past that, so each
+        // of them was a real call per decoded sequence / symbol. HotSpot inlined them, hence no x86 gap.
         final boolean split = SPLIT_LONGS;
         long[] scratch = new long[2]; // one per call; only the cold refill path below uses it
         int bitsConsumed = BitInputStream.initializeBits(inputBase, inputAddress, inputLimit, scratch);
@@ -162,13 +166,13 @@ class Huffman
             // ARM/ART: entry = symbol | numberOfBits << 8 (one table load per symbol); the 4
             // symbols are collected in a register and written with one putInt - putByte is a JNI
             // call on ART builds that don't intrinsify it (pre-Android 15 ART module)
-            int e0 = entries[(int) peekBitsFast(bitsConsumed, bits, tableLog)];
+            int e0 = entries[(int) ((bits << bitsConsumed) >>> (64 - tableLog))];
             bitsConsumed += e0 >>> 8;
-            int e1 = entries[(int) peekBitsFast(bitsConsumed, bits, tableLog)];
+            int e1 = entries[(int) ((bits << bitsConsumed) >>> (64 - tableLog))];
             bitsConsumed += e1 >>> 8;
-            int e2 = entries[(int) peekBitsFast(bitsConsumed, bits, tableLog)];
+            int e2 = entries[(int) ((bits << bitsConsumed) >>> (64 - tableLog))];
             bitsConsumed += e2 >>> 8;
-            int e3 = entries[(int) peekBitsFast(bitsConsumed, bits, tableLog)];
+            int e3 = entries[(int) ((bits << bitsConsumed) >>> (64 - tableLog))];
             bitsConsumed += e3 >>> 8;
             UNSAFE.putInt(outputBase, output, (e0 & 0xFF) | (e1 & 0xFF) << 8 | (e2 & 0xFF) << 16 | e3 << 24);
             output += SIZE_OF_INT;
@@ -179,6 +183,10 @@ class Huffman
 
     public void decode4Streams(final Object inputBase, final long inputAddress, final long inputLimit, final Object outputBase, final long outputAddress, final long outputLimit)
     {
+        // ARM/ART: peekBits / peekBitsFast / verify are written out in this method. ART's inliner stops
+        // inlining into a method once it passes ~1024 IR instructions (kMaximumNumberOfTotalInstructions;
+        // only callees of <= 3 instructions still get inlined), and this method is past that, so each
+        // of them was a real call per decoded sequence / symbol. HotSpot inlined them, hence no x86 gap.
         final boolean split = SPLIT_LONGS;
         verify(inputLimit - inputAddress >= 10, inputAddress, "Input is corrupted"); // jump table + 1 byte per stream
 
@@ -187,7 +195,9 @@ class Huffman
         long start3 = start2 + (UNSAFE.getShort(inputBase, inputAddress + 2) & 0xFFFF);
         long start4 = start3 + (UNSAFE.getShort(inputBase, inputAddress + 4) & 0xFFFF);
 
-        verify(start2 < start3 && start3 < start4 && start4 < inputLimit, inputAddress, "Input is corrupted");
+        if (!(start2 < start3 && start3 < start4 && start4 < inputLimit)) {
+            throw fail(inputAddress, "Input is corrupted");
+        }
 
         long[] scratch = new long[2]; // one per call; only the cold refill paths below use it
         int stream1bitsConsumed = BitInputStream.initializeBits(inputBase, start1, start2, scratch);
@@ -225,55 +235,55 @@ class Huffman
             // ARM/ART: 4 symbols per stream, each stream's bytes collected in a register and written
             // with one putInt (see decodeSingleStream); entry = symbol | numberOfBits << 8
             int e;
-            e = entries[(int) peekBitsFast(stream1bitsConsumed, stream1bits, tableLog)];
+            e = entries[(int) ((stream1bits << stream1bitsConsumed) >>> (64 - tableLog))];
             stream1bitsConsumed += e >>> 8;
             int out1 = e & 0xFF;
-            e = entries[(int) peekBitsFast(stream2bitsConsumed, stream2bits, tableLog)];
+            e = entries[(int) ((stream2bits << stream2bitsConsumed) >>> (64 - tableLog))];
             stream2bitsConsumed += e >>> 8;
             int out2 = e & 0xFF;
-            e = entries[(int) peekBitsFast(stream3bitsConsumed, stream3bits, tableLog)];
+            e = entries[(int) ((stream3bits << stream3bitsConsumed) >>> (64 - tableLog))];
             stream3bitsConsumed += e >>> 8;
             int out3 = e & 0xFF;
-            e = entries[(int) peekBitsFast(stream4bitsConsumed, stream4bits, tableLog)];
+            e = entries[(int) ((stream4bits << stream4bitsConsumed) >>> (64 - tableLog))];
             stream4bitsConsumed += e >>> 8;
             int out4 = e & 0xFF;
 
-            e = entries[(int) peekBitsFast(stream1bitsConsumed, stream1bits, tableLog)];
+            e = entries[(int) ((stream1bits << stream1bitsConsumed) >>> (64 - tableLog))];
             stream1bitsConsumed += e >>> 8;
             out1 |= (e & 0xFF) << 8;
-            e = entries[(int) peekBitsFast(stream2bitsConsumed, stream2bits, tableLog)];
+            e = entries[(int) ((stream2bits << stream2bitsConsumed) >>> (64 - tableLog))];
             stream2bitsConsumed += e >>> 8;
             out2 |= (e & 0xFF) << 8;
-            e = entries[(int) peekBitsFast(stream3bitsConsumed, stream3bits, tableLog)];
+            e = entries[(int) ((stream3bits << stream3bitsConsumed) >>> (64 - tableLog))];
             stream3bitsConsumed += e >>> 8;
             out3 |= (e & 0xFF) << 8;
-            e = entries[(int) peekBitsFast(stream4bitsConsumed, stream4bits, tableLog)];
+            e = entries[(int) ((stream4bits << stream4bitsConsumed) >>> (64 - tableLog))];
             stream4bitsConsumed += e >>> 8;
             out4 |= (e & 0xFF) << 8;
 
-            e = entries[(int) peekBitsFast(stream1bitsConsumed, stream1bits, tableLog)];
+            e = entries[(int) ((stream1bits << stream1bitsConsumed) >>> (64 - tableLog))];
             stream1bitsConsumed += e >>> 8;
             out1 |= (e & 0xFF) << 16;
-            e = entries[(int) peekBitsFast(stream2bitsConsumed, stream2bits, tableLog)];
+            e = entries[(int) ((stream2bits << stream2bitsConsumed) >>> (64 - tableLog))];
             stream2bitsConsumed += e >>> 8;
             out2 |= (e & 0xFF) << 16;
-            e = entries[(int) peekBitsFast(stream3bitsConsumed, stream3bits, tableLog)];
+            e = entries[(int) ((stream3bits << stream3bitsConsumed) >>> (64 - tableLog))];
             stream3bitsConsumed += e >>> 8;
             out3 |= (e & 0xFF) << 16;
-            e = entries[(int) peekBitsFast(stream4bitsConsumed, stream4bits, tableLog)];
+            e = entries[(int) ((stream4bits << stream4bitsConsumed) >>> (64 - tableLog))];
             stream4bitsConsumed += e >>> 8;
             out4 |= (e & 0xFF) << 16;
 
-            e = entries[(int) peekBitsFast(stream1bitsConsumed, stream1bits, tableLog)];
+            e = entries[(int) ((stream1bits << stream1bitsConsumed) >>> (64 - tableLog))];
             stream1bitsConsumed += e >>> 8;
             out1 |= e << 24;
-            e = entries[(int) peekBitsFast(stream2bitsConsumed, stream2bits, tableLog)];
+            e = entries[(int) ((stream2bits << stream2bitsConsumed) >>> (64 - tableLog))];
             stream2bitsConsumed += e >>> 8;
             out2 |= e << 24;
-            e = entries[(int) peekBitsFast(stream3bitsConsumed, stream3bits, tableLog)];
+            e = entries[(int) ((stream3bits << stream3bitsConsumed) >>> (64 - tableLog))];
             stream3bitsConsumed += e >>> 8;
             out3 |= e << 24;
-            e = entries[(int) peekBitsFast(stream4bitsConsumed, stream4bits, tableLog)];
+            e = entries[(int) ((stream4bits << stream4bitsConsumed) >>> (64 - tableLog))];
             stream4bitsConsumed += e >>> 8;
             out4 |= e << 24;
 
@@ -349,7 +359,9 @@ class Huffman
             }
         }
 
-        verify(output1 <= outputStart2 && output2 <= outputStart3 && output3 <= outputStart4, inputAddress, "Input is corrupted");
+        if (!(output1 <= outputStart2 && output2 <= outputStart3 && output3 <= outputStart4)) {
+            throw fail(inputAddress, "Input is corrupted");
+        }
 
         /// finish streams one by one
         decodeTail(inputBase, start1, stream1currentAddress, stream1bitsConsumed, stream1bits, outputBase, output1, outputStart2);
@@ -374,14 +386,14 @@ class Huffman
                 break;
             }
 
-            int e = entries[(int) peekBitsFast(bitsConsumed, bits, tableLog)];
+            int e = entries[(int) ((bits << bitsConsumed) >>> (64 - tableLog))];
             UNSAFE.putByte(outputBase, outputAddress++, (byte) e);
             bitsConsumed += e >>> 8;
         }
 
         // not more data in bit stream, so no need to reload
         while (outputAddress < outputLimit) {
-            int e = entries[(int) peekBitsFast(bitsConsumed, bits, tableLog)];
+            int e = entries[(int) ((bits << bitsConsumed) >>> (64 - tableLog))];
             UNSAFE.putByte(outputBase, outputAddress++, (byte) e);
             bitsConsumed += e >>> 8;
         }
