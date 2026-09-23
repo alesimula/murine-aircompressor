@@ -389,7 +389,14 @@ class ZstdFrameDecompressor
             int[] matchLengthBaseTable = MATCH_LENGTH_BASE;
             int[] offsetCodesBaseTable = OFFSET_CODES_BASE;
 
+            // ARM/ART: the three repeat offsets live in locals for the whole block and are written
+            // back once after the loop. As array elements they were re-read and re-written with
+            // bounds checks on every sequence: each copy below is an Unsafe call, which ART treats
+            // as possibly changing any memory, so it could not keep them in registers.
             int[] previousOffsets = this.previousOffsets;
+            int repeatOffset0 = previousOffsets[0];
+            int repeatOffset1 = previousOffsets[1];
+            int repeatOffset2 = previousOffsets[2];
 
             byte[] literalsLengthNumbersOfBits = currentLiteralsLengthTable.numberOfBits;
             int[] literalsLengthNewStates = currentLiteralsLengthTable.newState;
@@ -459,10 +466,10 @@ class ZstdFrameDecompressor
                     if (offset != 0) {
                         int temp;
                         if (offset == 3) {
-                            temp = previousOffsets[0] - 1;
+                            temp = repeatOffset0 - 1;
                         }
                         else {
-                            temp = previousOffsets[offset];
+                            temp = offset == 1 ? repeatOffset1 : repeatOffset2; // offset is 1 or 2 here
                         }
 
                         if (temp == 0) {
@@ -470,21 +477,21 @@ class ZstdFrameDecompressor
                         }
 
                         if (offset != 1) {
-                            previousOffsets[2] = previousOffsets[1];
+                            repeatOffset2 = repeatOffset1;
                         }
-                        previousOffsets[1] = previousOffsets[0];
-                        previousOffsets[0] = temp;
+                        repeatOffset1 = repeatOffset0;
+                        repeatOffset0 = temp;
 
                         offset = temp;
                     }
                     else {
-                        offset = previousOffsets[0];
+                        offset = repeatOffset0;
                     }
                 }
                 else {
-                    previousOffsets[2] = previousOffsets[1];
-                    previousOffsets[1] = previousOffsets[0];
-                    previousOffsets[0] = offset;
+                    repeatOffset2 = repeatOffset1;
+                    repeatOffset1 = repeatOffset0;
+                    repeatOffset0 = offset;
                 }
 
                 int matchLength = matchLengthBaseTable[matchLengthCode];
@@ -555,14 +562,61 @@ class ZstdFrameDecompressor
                 else {
                     // copy literals. literalOutputLimit <= fastOutputLimit, so we can copy
                     // long at a time with over-copy
-                    output = copyLiterals(outputBase, literalsBase, output, literalsInput, literalOutputLimit);
-                    // copyMatch was a pure pass-through around these two - one call layer deleted
-                    long tailAddress = copyMatchHead(outputBase, output, offset, matchAddress);
-                    copyMatchTail(outputBase, fastOutputLimit, output + SIZE_OF_LONG, matchOutputLimit, tailAddress, matchLength - SIZE_OF_LONG, fastMatchOutputLimit);
+                    // ---- begin inlined copyLiterals / copyMatchHead / copyMatchTail (common case) ----
+                    // ARM/ART: the three helpers contain loops and are too big for ART to inline, so
+                    // they were three real calls per sequence. Most sequences have <= 8 literal bytes,
+                    // a match offset >= 8 and a match of <= 16 bytes: those take three 8-byte copies
+                    // here. Anything longer or closer continues in the helpers. Same bytes written.
+                    long literalsValue = (split ? ((UNSAFE.getInt(literalsBase, literalsInput) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(literalsBase, literalsInput + 4) << 32)) : UNSAFE.getLong(literalsBase, literalsInput));
+                    if (split) {
+                        UNSAFE.putInt(outputBase, output, (int) literalsValue);
+                        UNSAFE.putInt(outputBase, output + 4, (int) (literalsValue >>> 32));
+                    }
+                    else {
+                        UNSAFE.putLong(outputBase, output, literalsValue);
+                    }
+                    if (output + SIZE_OF_LONG < literalOutputLimit) {
+                        copyLiterals(outputBase, literalsBase, output + SIZE_OF_LONG, literalsInput + SIZE_OF_LONG, literalOutputLimit);
+                    }
+                    output = literalOutputLimit;
+
+                    long tailAddress;
+                    if (offset >= SIZE_OF_LONG) {
+                        long matchValue = (split ? ((UNSAFE.getInt(outputBase, matchAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(outputBase, matchAddress + 4) << 32)) : UNSAFE.getLong(outputBase, matchAddress));
+                        if (split) {
+                            UNSAFE.putInt(outputBase, output, (int) matchValue);
+                            UNSAFE.putInt(outputBase, output + 4, (int) (matchValue >>> 32));
+                        }
+                        else {
+                            UNSAFE.putLong(outputBase, output, matchValue);
+                        }
+                        tailAddress = matchAddress + SIZE_OF_LONG;
+                    }
+                    else {
+                        tailAddress = copyMatchHead(outputBase, output, offset, matchAddress);
+                    }
+
+                    if (matchLength <= 2 * SIZE_OF_LONG && matchOutputLimit < fastMatchOutputLimit) {
+                        long tailValue = (split ? ((UNSAFE.getInt(outputBase, tailAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(outputBase, tailAddress + 4) << 32)) : UNSAFE.getLong(outputBase, tailAddress));
+                        if (split) {
+                            UNSAFE.putInt(outputBase, output + SIZE_OF_LONG, (int) tailValue);
+                            UNSAFE.putInt(outputBase, output + SIZE_OF_LONG + 4, (int) (tailValue >>> 32));
+                        }
+                        else {
+                            UNSAFE.putLong(outputBase, output + SIZE_OF_LONG, tailValue);
+                        }
+                    }
+                    else {
+                        copyMatchTail(outputBase, fastOutputLimit, output + SIZE_OF_LONG, matchOutputLimit, tailAddress, matchLength - SIZE_OF_LONG, fastMatchOutputLimit);
+                    }
+                    // ---- end inlined copyLiterals / copyMatchHead / copyMatchTail ----
                 }
                 output = matchOutputLimit;
                 literalsInput = literalEnd;
             }
+            previousOffsets[0] = repeatOffset0;
+            previousOffsets[1] = repeatOffset1;
+            previousOffsets[2] = repeatOffset2;
         }
 
         // last literal segment
