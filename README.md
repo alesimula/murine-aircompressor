@@ -1,4 +1,4 @@
-# Compression for Java
+# Compression for Java and Android
 
 [![](https://jitpack.io/v/alesimula/murine-aircompressor.svg)](https://jitpack.io/#alesimula/murine-aircompressor) [![Build Status](https://img.shields.io/badge/build-passing-blue.svg)](https://jitpack.io/#alesimula/murine-aircompressor) [![License](https://img.shields.io/hexpm/l/plug.svg)](https://github.com/alesimula/murine-aircompressor/blob/main/license.txt)
 
@@ -12,9 +12,9 @@ members the library relied on are replaced with portable equivalents, and
 Android's own heap/native memcpy primitives are used when available (resolved
 once, with a pure-Java fallback).
 
-The Android support is a POC, won't quite match the performance of zstd-jni AAR libraries,
-but is still way more performant than other integrated algorithms such as gzip;
-do not benchmark on debug builds, performance will suffer greatly.
+On Android, zstd's performance is close to that of the native zstd-jni AAR libraries, without
+shipping any native code, and well ahead of the platform's built-in algorithms such as gzip.
+Benchmark on release builds only: debug builds are not optimized by ART and run much slower.
 
 # Installation
 
@@ -33,7 +33,7 @@ allprojects {
 Then add the dependency:
 
 ```gradle
-    implementation 'com.github.alesimula:murine-aircompressor:2.0.13'
+    implementation 'com.github.alesimula:murine-aircompressor:2.0.14'
 ```
 
 **Using Maven**
@@ -51,7 +51,7 @@ Then add the dependency:
 <dependency>
     <groupId>com.github.alesimula</groupId>
     <artifactId>murine-aircompressor</artifactId>
-    <version>2.0.13</version>
+    <version>2.0.14</version>
 </dependency>
 ```
 
@@ -144,12 +144,13 @@ The implementation is provided by the `ZstdCompressor` and `ZstdDecompressor`
 classes. The Zstandard streaming format is supported by `ZstdInputStream` and
 `ZstdOutputStream`.
 
-The compression level can be selected, although it's recommended to leave the default level 3
-or use 2 for faster compression.
+The compression level can be selected. The default is level 2 (zstd's own default is 3):
+on older devices it is considerably faster than level 3, for a (very) negligible loss in compression
+ratio. Level 3 remains available when ratio matters more than speed.
 
 Note that the Java implementation only includes the `FAST` and `DFAST`
-strategies: the streaming compressor supports levels 1, 2 (good and fast), 3 (default) 
-and 4 (not recommended, nearly identical to 3 but slower); higher 
+strategies: the streaming compressor supports levels 1, 2 (default), 3 (better ratio, slower)
+and 4 (not recommended, nearly identical to 3 but slower); level 0 selects the default; higher 
 strategies (`GREEDY` through `BTULTRA`) are not implemented and are rejected
 at construction. Decompression is strategy-agnostic and handles frames
 produced at any level by any zstd implementation.
@@ -230,7 +231,3 @@ that have Hadoop dependencies, each algorithm also provides a `CompressionCodec`
 
 This library requires a Java 1.8+ virtual machine containing the `sun.misc.Unsafe`
 interface running on a little endian platform. Android 8.0+ (API 26+) is supported.
-
-# Users
-
-This library is used in projects such as Trino (https://trino.io), a distributed SQL engine.
