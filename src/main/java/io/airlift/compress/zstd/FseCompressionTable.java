@@ -22,6 +22,10 @@ class FseCompressionTable
     final short[] nextState;
     final int[] deltaNumberOfBits;
     final int[] deltaFindState;
+    // ARM/ART: deltaFindState << 32 | deltaNumberOfBits, so SequenceEncoder's loop does one array
+    // read (and one bounds check) per table per sequence instead of two. Kept in sync with the two
+    // arrays above wherever they change.
+    final long[] deltaPacked;
 
     int log2Size;
 
@@ -36,6 +40,7 @@ class FseCompressionTable
         nextState = new short[1 << maxTableLog];
         deltaNumberOfBits = new int[maxSymbol + 1];
         deltaFindState = new int[maxSymbol + 1];
+        deltaPacked = new long[maxSymbol + 1];
         spreadScratch = new byte[1 << maxTableLog];
     }
 
@@ -56,6 +61,7 @@ class FseCompressionTable
 
         deltaFindState[symbol] = 0;
         deltaNumberOfBits[symbol] = 0;
+        deltaPacked[symbol] = 0;
     }
 
     public void initialize(short[] normalizedCounts, int maxSymbol, int tableLog)
@@ -119,6 +125,10 @@ class FseCompressionTable
                     total += normalizedCounts[symbol];
                     break;
             }
+        }
+
+        for (int symbol = 0; symbol < deltaPacked.length; symbol++) {
+            deltaPacked[symbol] = ((long) deltaFindState[symbol] << 32) | (deltaNumberOfBits[symbol] & 0xFFFFFFFFL);
         }
     }
 

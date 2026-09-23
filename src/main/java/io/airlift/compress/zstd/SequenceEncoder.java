@@ -261,15 +261,14 @@ class SequenceEncoder
         int[] literalsLengthBits = LITERALS_LENGTH_BITS;
         int[] matchLengthBitsTable = MATCH_LENGTH_BITS;
 
+        // ARM/ART: deltaFindState << 32 | deltaNumberOfBits packed per symbol: one read + bounds check
+        // per table per sequence instead of two
         short[] mlNextState = matchLengthTable.nextState;
-        int[] mlDeltaBits = matchLengthTable.deltaNumberOfBits;
-        int[] mlDeltaFind = matchLengthTable.deltaFindState;
+        long[] mlDelta = matchLengthTable.deltaPacked;
         short[] offNextState = offsetsTable.nextState;
-        int[] offDeltaBits = offsetsTable.deltaNumberOfBits;
-        int[] offDeltaFind = offsetsTable.deltaFindState;
+        long[] offDelta = offsetsTable.deltaPacked;
         short[] llNextState = literalLengthTable.nextState;
-        int[] llDeltaBits = literalLengthTable.deltaNumberOfBits;
-        int[] llDeltaFind = literalLengthTable.deltaFindState;
+        long[] llDelta = literalLengthTable.deltaPacked;
 
         int outputSize = (int) (outputLimit - output);
         checkArgument(outputSize >= SIZE_OF_LONG, "Output buffer too small");
@@ -282,14 +281,17 @@ class SequenceEncoder
 
         // first symbols (FseCompressionTable.begin)
         int mlSymbol = matchLengthCodes[sequenceCount - 1];
-        int mlBeginBits = (mlDeltaBits[mlSymbol] + (1 << 15)) >>> 16;
-        int matchLengthState = mlNextState[(((mlBeginBits << 16) - mlDeltaBits[mlSymbol]) >>> mlBeginBits) + mlDeltaFind[mlSymbol]];
+        long mlSymbolDelta = mlDelta[mlSymbol];
+        int mlBeginBits = ((int) mlSymbolDelta + (1 << 15)) >>> 16;
+        int matchLengthState = mlNextState[(((mlBeginBits << 16) - (int) mlSymbolDelta) >>> mlBeginBits) + (int) (mlSymbolDelta >> 32)];
         int offSymbol = offsetCodes[sequenceCount - 1];
-        int offBeginBits = (offDeltaBits[offSymbol] + (1 << 15)) >>> 16;
-        int offsetState = offNextState[(((offBeginBits << 16) - offDeltaBits[offSymbol]) >>> offBeginBits) + offDeltaFind[offSymbol]];
+        long offSymbolDelta = offDelta[offSymbol];
+        int offBeginBits = ((int) offSymbolDelta + (1 << 15)) >>> 16;
+        int offsetState = offNextState[(((offBeginBits << 16) - (int) offSymbolDelta) >>> offBeginBits) + (int) (offSymbolDelta >> 32)];
         int llSymbol = literalLengthCodes[sequenceCount - 1];
-        int llBeginBits = (llDeltaBits[llSymbol] + (1 << 15)) >>> 16;
-        int literalLengthState = llNextState[(((llBeginBits << 16) - llDeltaBits[llSymbol]) >>> llBeginBits) + llDeltaFind[llSymbol]];
+        long llSymbolDelta = llDelta[llSymbol];
+        int llBeginBits = ((int) llSymbolDelta + (1 << 15)) >>> 16;
+        int literalLengthState = llNextState[(((llBeginBits << 16) - (int) llSymbolDelta) >>> llBeginBits) + (int) (llSymbolDelta >> 32)];
 
         int bits = literalsLengthBits[literalLengthCodes[sequenceCount - 1]];
         container |= (literalLengthValues[sequenceCount - 1] & ((1L << bits) - 1)) << bitCount;
@@ -328,20 +330,23 @@ class SequenceEncoder
 
                 // (7)
                 // offsetState = offsetsTable.encode(blockStream, offsetState, offsetCode); // 15
-                int stateBits = (offsetState + offDeltaBits[offsetCode]) >>> 16;
+                long offCodeDelta = offDelta[offsetCode];
+                int stateBits = (offsetState + (int) offCodeDelta) >>> 16;
                 container |= (offsetState & ((1L << stateBits) - 1)) << bitCount;
                 bitCount += stateBits;
-                offsetState = offNextState[(offsetState >>> stateBits) + offDeltaFind[offsetCode]];
+                offsetState = offNextState[(offsetState >>> stateBits) + (int) (offCodeDelta >> 32)];
                 // matchLengthState = matchLengthTable.encode(blockStream, matchLengthState, matchLengthCode); // 24
-                stateBits = (matchLengthState + mlDeltaBits[matchLengthCode]) >>> 16;
+                long mlCodeDelta = mlDelta[matchLengthCode];
+                stateBits = (matchLengthState + (int) mlCodeDelta) >>> 16;
                 container |= (matchLengthState & ((1L << stateBits) - 1)) << bitCount;
                 bitCount += stateBits;
-                matchLengthState = mlNextState[(matchLengthState >>> stateBits) + mlDeltaFind[matchLengthCode]];
+                matchLengthState = mlNextState[(matchLengthState >>> stateBits) + (int) (mlCodeDelta >> 32)];
                 // literalLengthState = literalLengthTable.encode(blockStream, literalLengthState, literalLengthCode); // 33
-                stateBits = (literalLengthState + llDeltaBits[literalLengthCode]) >>> 16;
+                long llCodeDelta = llDelta[literalLengthCode];
+                stateBits = (literalLengthState + (int) llCodeDelta) >>> 16;
                 container |= (literalLengthState & ((1L << stateBits) - 1)) << bitCount;
                 bitCount += stateBits;
-                literalLengthState = llNextState[(literalLengthState >>> stateBits) + llDeltaFind[literalLengthCode]];
+                literalLengthState = llNextState[(literalLengthState >>> stateBits) + (int) (llCodeDelta >> 32)];
 
                 if ((offsetBits + matchLengthBits + literalLengthBits >= 64 - 7 - (LITERAL_LENGTH_TABLE_LOG + MATCH_LENGTH_TABLE_LOG + OFFSET_TABLE_LOG))) {
                     flushedBytes = bitCount >>> 3;                      /* (7)*/
