@@ -79,7 +79,7 @@ public class ZstdOutputStream
         this(outputStream, DEFAULT_COMPRESSION_LEVEL);
     }
 
-    // Murine: expose the compression level (0-22, default 3). Upstream v3 only exposes
+    // Murine: expose the compression level (0-22, default 2). Upstream v3 only exposes
     // this on the native compressor; the Java engine has always supported it internally.
     public ZstdOutputStream(OutputStream outputStream, int compressionLevel)
             throws IOException
@@ -114,7 +114,7 @@ public class ZstdOutputStream
     /**
      * Creates a compressing stream with zstd
      * @param outputStream the wrapped output stream
-     * @param compressionLevel compression level (0-22, default 3)
+     * @param compressionLevel compression level (0-22, default 2)
      * @param windowSlideMode see {@link WindowSlideMode}
      * @param bufferMode see {@link BufferMode}; {@link BufferMode#RING_BUFFER} is the default
      */

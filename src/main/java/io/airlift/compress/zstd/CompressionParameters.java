@@ -23,7 +23,8 @@ class CompressionParameters
 {
     private static final int MIN_HASH_LOG = 6;
 
-    public static final int DEFAULT_COMPRESSION_LEVEL = 3;
+    // Murine: 2 instead of zstd's 3; much faster on older devices for a small loss in ratio
+    public static final int DEFAULT_COMPRESSION_LEVEL = 2;
     private static final int MAX_COMPRESSION_LEVEL = 22;
 
     private final int windowLog; // largest match distance : larger == more compression, more memory needed during decompression
@@ -261,7 +262,7 @@ class CompressionParameters
             throw new IllegalArgumentException("Compression level " + compressionLevel
                     + " requires strategy " + parameters.getStrategy()
                     + ", which is not implemented by the Java Zstd compressor"
-                    + " (supported: 1-2 (FAST) and 3-4 (DFAST; 3 is the default, level 0 is zstd's alias for it))");
+                    + " (supported: 1-2 (FAST; 2 is the default, level 0 is an alias for it) and 3-4 (DFAST))");
         }
     }
 

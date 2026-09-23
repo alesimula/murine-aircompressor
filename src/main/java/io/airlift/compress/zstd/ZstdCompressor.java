@@ -34,7 +34,7 @@ public class ZstdCompressor
         this(CompressionParameters.DEFAULT_COMPRESSION_LEVEL);
     }
 
-    // Murine: expose the compression level (0-22, default 3); see ZstdOutputStream
+    // Murine: expose the compression level (0-22, default 2); see ZstdOutputStream
     public ZstdCompressor(int compressionLevel)
     {
         // The parameter tables are selected per input size; probe every size class so an
