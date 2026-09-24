@@ -14,7 +14,9 @@ once, with a pure-Java fallback).
 
 On Android, zstd's performance is close to that of the native zstd-jni AAR libraries, without
 shipping any native code, and well ahead of the platform's built-in algorithms such as gzip.
-Benchmark on release builds only: debug builds are not optimized by ART and run much slower.
+
+> [!IMPORTANT]
+> Benchmark on release builds only: debug builds are not optimized by ART and run exponentially slower.
 
 # Installation
 
