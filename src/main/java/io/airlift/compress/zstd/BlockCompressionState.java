@@ -17,37 +17,72 @@ import java.util.Arrays;
 
 class BlockCompressionState
 {
+    // Rewrite the tables only once positions pass this bias (zstd's overflow correction)
+    private static final long MAX_INDEX_BIAS = 1L << 30;
+
     public final int[] hashTable;
     public final int[] chainTable;
 
-    private final long baseAddress;
+    // address of the first byte of the caller's buffer
+    private final long bufferAddress;
+    // Table entries are positions relative to baseAddress. A window slide moves the data back by
+    // `slide` bytes and baseAddress back by the same amount, so every entry still points at the
+    // same bytes without being rewritten (as zstd moves window.base). baseAddress = bufferAddress - indexBias.
+    private long baseAddress;
+    private long indexBias;
 
     // starting point of the window with respect to baseAddress
     private int windowBaseOffset;
 
     public BlockCompressionState(CompressionParameters parameters, long baseAddress)
     {
+        this.bufferAddress = baseAddress;
         this.baseAddress = baseAddress;
         hashTable = new int[1 << parameters.getHashLog()];
-        chainTable = new int[1 << parameters.getChainLog()]; // TODO: chain table not used by Strategy.FAST
+        // FAST only uses hashTable; DFAST uses chainTable as its short hash table
+        chainTable = parameters.getStrategy() == CompressionParameters.Strategy.FAST ? new int[0] : new int[1 << parameters.getChainLog()];
     }
 
     public void slideWindow(int slideWindowSize, boolean rebaseWindowBase)
     {
+        // Entries older than the slide now point before the buffer: they are below the window base
+        // (which never goes below bufferAddress), so the match finders reject them, exactly as
+        // they rejected the entries the old per-slide rewrite clamped to 0.
+        baseAddress -= slideWindowSize;
+        indexBias += slideWindowSize;
         if (rebaseWindowBase) {
-            windowBaseOffset = Math.max(0, windowBaseOffset - slideWindowSize);
+            // same window as before the slide, clamped to the start of the buffer
+            windowBaseOffset = (int) Math.max(windowBaseOffset, indexBias);
         }
-        for (int i = 0; i < hashTable.length; i++) {
-            int newValue = hashTable[i] - slideWindowSize;
+        else {
+            // the window base keeps its address, so it moves forward relative to the moved data
+            windowBaseOffset += slideWindowSize;
+        }
+
+        if (indexBias > MAX_INDEX_BIAS) {
+            removeIndexBias();
+        }
+    }
+
+    // Bring positions back to bufferAddress before they overflow an int: the per-slide rewrite
+    // this class used to do, now done once every ~1 GB of input.
+    private void removeIndexBias()
+    {
+        int bias = (int) indexBias;
+        windowBaseOffset = Math.max(0, windowBaseOffset - bias);
+        reduceTable(hashTable, bias);
+        reduceTable(chainTable, bias);
+        baseAddress = bufferAddress;
+        indexBias = 0;
+    }
+
+    private static void reduceTable(int[] table, int reduction)
+    {
+        for (int i = 0; i < table.length; i++) {
+            int newValue = table[i] - reduction;
             // if new value is negative, set it to zero branchless
             newValue = newValue & (~(newValue >> 31));
-            hashTable[i] = newValue;
-        }
-        for (int i = 0; i < chainTable.length; i++) {
-            int newValue = chainTable[i] - slideWindowSize;
-            // if new value is negative, set it to zero branchless
-            newValue = newValue & (~(newValue >> 31));
-            chainTable[i] = newValue;
+            table[i] = newValue;
         }
     }
 
