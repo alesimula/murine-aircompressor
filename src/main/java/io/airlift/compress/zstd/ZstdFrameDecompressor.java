@@ -155,6 +155,9 @@ class ZstdFrameDecompressor
 
             FrameHeader frameHeader = readFrameHeader(inputBase, input, inputLimit);
             input += frameHeader.headerSize;
+            // checksum per block while the block is still in cache, like native zstd (one pass over the
+            // whole output at the end read it back from memory)
+            XxHash64 hasher = frameHeader.hasChecksum ? new XxHash64() : null;
 
             boolean lastBlock;
             do {
@@ -189,6 +192,9 @@ class ZstdFrameDecompressor
                         throw fail(input, "Invalid block type");
                 }
 
+                if (hasher != null) {
+                    hasher.update(outputBase, output, decodedSize);
+                }
                 output += decodedSize;
             }
             while (!lastBlock);
@@ -196,7 +202,7 @@ class ZstdFrameDecompressor
             if (frameHeader.hasChecksum) {
                 int decodedFrameSize = (int) (output - outputStart);
 
-                long hash = XxHash64.hash(0, outputBase, outputStart, decodedFrameSize);
+                long hash = hasher.hash();
 
                 verify(input + SIZE_OF_INT <= inputLimit, input, "Not enough input bytes");
                 int checksum = UNSAFE.getInt(inputBase, input);

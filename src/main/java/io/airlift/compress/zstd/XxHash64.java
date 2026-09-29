@@ -16,6 +16,8 @@ package io.airlift.compress.zstd;
 import java.io.IOException;
 import java.io.InputStream;
 
+import sun.misc.Unsafe;
+
 import static io.airlift.compress.UnsafeUtil.ARRAY_BYTE_BASE_OFFSET;
 import static io.airlift.compress.UnsafeUtil.SPLIT_LONGS;
 import static io.airlift.compress.UnsafeUtil.UNSAFE;
@@ -72,6 +74,13 @@ final class XxHash64
     {
         checkPositionIndexes(offset, offset + length, data.length);
         updateHash(data, ARRAY_BYTE_BASE_OFFSET + offset, length);
+        return this;
+    }
+
+    // no bounds checks: callers pass a validated region
+    XxHash64 update(Object base, long address, int length)
+    {
+        updateHash(base, address, length);
         return this;
     }
 
@@ -133,6 +142,10 @@ final class XxHash64
 
     private int updateBody(Object base, long address, int length)
     {
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
         final boolean split = SPLIT_LONGS;
         // ARM/ART: accumulators in locals - with the fields, every Unsafe read (which ART treats as
         // having all side effects) forced v1..v4 to be stored and reloaded on each 32-byte step
@@ -142,10 +155,10 @@ final class XxHash64
         long v4 = this.v4;
         int remaining = length;
         while (remaining >= 32) {
-            v1 = mix(v1, (split ? ((UNSAFE.getInt(base, address) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(base, address + 4) << 32)) : UNSAFE.getLong(base, address)));
-            v2 = mix(v2, (split ? ((UNSAFE.getInt(base, (address + 8)) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(base, (address + 8) + 4) << 32)) : UNSAFE.getLong(base, address + 8)));
-            v3 = mix(v3, (split ? ((UNSAFE.getInt(base, (address + 16)) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(base, (address + 16) + 4) << 32)) : UNSAFE.getLong(base, address + 16)));
-            v4 = mix(v4, (split ? ((UNSAFE.getInt(base, (address + 24)) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(base, (address + 24) + 4) << 32)) : UNSAFE.getLong(base, address + 24)));
+            v1 = mix(v1, (split ? ((unsafe.getInt(base, address) & 0xFFFFFFFFL) | ((long) unsafe.getInt(base, address + 4) << 32)) : unsafe.getLong(base, address)));
+            v2 = mix(v2, (split ? ((unsafe.getInt(base, (address + 8)) & 0xFFFFFFFFL) | ((long) unsafe.getInt(base, (address + 8) + 4) << 32)) : unsafe.getLong(base, address + 8)));
+            v3 = mix(v3, (split ? ((unsafe.getInt(base, (address + 16)) & 0xFFFFFFFFL) | ((long) unsafe.getInt(base, (address + 16) + 4) << 32)) : unsafe.getLong(base, address + 16)));
+            v4 = mix(v4, (split ? ((unsafe.getInt(base, (address + 24)) & 0xFFFFFFFFL) | ((long) unsafe.getInt(base, (address + 24) + 4) << 32)) : unsafe.getLong(base, address + 24)));
 
             address += 32;
             remaining -= 32;
@@ -212,19 +225,23 @@ final class XxHash64
 
     private static long updateTail(long hash, Object base, long address, int index, int length)
     {
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
         final boolean split = SPLIT_LONGS;
         while (index <= length - 8) {
-            hash = updateTail(hash, (split ? ((UNSAFE.getInt(base, (address + index)) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(base, (address + index) + 4) << 32)) : UNSAFE.getLong(base, address + index)));
+            hash = updateTail(hash, (split ? ((unsafe.getInt(base, (address + index)) & 0xFFFFFFFFL) | ((long) unsafe.getInt(base, (address + index) + 4) << 32)) : unsafe.getLong(base, address + index)));
             index += 8;
         }
 
         if (index <= length - 4) {
-            hash = updateTail(hash, UNSAFE.getInt(base, address + index));
+            hash = updateTail(hash, unsafe.getInt(base, address + index));
             index += 4;
         }
 
         while (index < length) {
-            hash = updateTail(hash, UNSAFE.getByte(base, address + index));
+            hash = updateTail(hash, unsafe.getByte(base, address + index));
             index++;
         }
 
@@ -235,6 +252,10 @@ final class XxHash64
 
     private static long updateBody(long seed, Object base, long address, int length)
     {
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
         final boolean split = SPLIT_LONGS;
         long v1 = seed + PRIME64_1 + PRIME64_2;
         long v2 = seed + PRIME64_2;
@@ -243,10 +264,10 @@ final class XxHash64
 
         int remaining = length;
         while (remaining >= 32) {
-            v1 = mix(v1, (split ? ((UNSAFE.getInt(base, address) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(base, address + 4) << 32)) : UNSAFE.getLong(base, address)));
-            v2 = mix(v2, (split ? ((UNSAFE.getInt(base, (address + 8)) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(base, (address + 8) + 4) << 32)) : UNSAFE.getLong(base, address + 8)));
-            v3 = mix(v3, (split ? ((UNSAFE.getInt(base, (address + 16)) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(base, (address + 16) + 4) << 32)) : UNSAFE.getLong(base, address + 16)));
-            v4 = mix(v4, (split ? ((UNSAFE.getInt(base, (address + 24)) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(base, (address + 24) + 4) << 32)) : UNSAFE.getLong(base, address + 24)));
+            v1 = mix(v1, (split ? ((unsafe.getInt(base, address) & 0xFFFFFFFFL) | ((long) unsafe.getInt(base, address + 4) << 32)) : unsafe.getLong(base, address)));
+            v2 = mix(v2, (split ? ((unsafe.getInt(base, (address + 8)) & 0xFFFFFFFFL) | ((long) unsafe.getInt(base, (address + 8) + 4) << 32)) : unsafe.getLong(base, address + 8)));
+            v3 = mix(v3, (split ? ((unsafe.getInt(base, (address + 16)) & 0xFFFFFFFFL) | ((long) unsafe.getInt(base, (address + 16) + 4) << 32)) : unsafe.getLong(base, address + 16)));
+            v4 = mix(v4, (split ? ((unsafe.getInt(base, (address + 24)) & 0xFFFFFFFFL) | ((long) unsafe.getInt(base, (address + 24) + 4) << 32)) : unsafe.getLong(base, address + 24)));
 
             address += 32;
             remaining -= 32;
