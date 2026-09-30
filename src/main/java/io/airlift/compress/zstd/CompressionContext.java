@@ -13,6 +13,8 @@
  */
 package io.airlift.compress.zstd;
 
+import io.airlift.compress.AircompressorConfig;
+
 import java.lang.ref.SoftReference;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -21,6 +23,7 @@ import static io.airlift.compress.zstd.Util.checkArgument;
 
 class CompressionContext
 {
+    // Only when AircompressorConfig.isZstdMemoryReuse() is on (off by default):
     // One spare context left by a finished compression (see release()). The next compression with
     // tables of the same sizes takes it instead of allocating them again (about 1 MB at the default
     // level; for small inputs the allocation and the garbage collections it causes cost more than the
@@ -51,9 +54,13 @@ class CompressionContext
         blockCompressionState = new BlockCompressionState(parameters, baseAddress);
     }
 
-    // the spare context when it fits these parameters (reset as if new), else a new one
+    // the spare context when it fits these parameters (reset as if new), else a new one;
+    // always a new one unless AircompressorConfig.isZstdMemoryReuse() is on
     static CompressionContext acquire(CompressionParameters parameters, long baseAddress, int inputSize)
     {
+        if (!AircompressorConfig.isZstdMemoryReuse()) {
+            return new CompressionContext(parameters, baseAddress, inputSize);
+        }
         SoftReference<CompressionContext> spareReference = SPARE.getAndSet(null);
         CompressionContext spare = spareReference == null ? null : spareReference.get();
         if (spare != null) {
@@ -69,7 +76,15 @@ class CompressionContext
     // compression finished: hand the context to the next one (must not be used after this)
     void release()
     {
-        SPARE.set(new SoftReference<>(this));
+        if (AircompressorConfig.isZstdMemoryReuse()) {
+            SPARE.set(new SoftReference<>(this));
+        }
+    }
+
+    // drops the spare context (ZstdMemory.release())
+    static void clearSpare()
+    {
+        SPARE.set(null);
     }
 
     private boolean fits(CompressionParameters parameters, int inputSize)

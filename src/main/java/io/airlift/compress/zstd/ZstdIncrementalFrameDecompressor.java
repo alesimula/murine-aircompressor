@@ -13,6 +13,7 @@
  */
 package io.airlift.compress.zstd;
 
+import io.airlift.compress.AircompressorConfig;
 import io.airlift.compress.MalformedInputException;
 
 import java.lang.ref.SoftReference;
@@ -70,6 +71,7 @@ public class ZstdIncrementalFrameDecompressor
     // current window buffer
     private byte[] windowBase = new byte[0];
 
+    // Only when AircompressorConfig.isZstdMemoryReuse() is on (off by default):
     // One spare window buffer left by a closed stream (see release()). A new stream takes it instead of
     // allocating, zeroing and then growing a multi-megabyte array by doubling (like zstd-jni's
     // RecyclingBufferPool). Soft reference: the GC can drop it under memory pressure.
@@ -83,10 +85,16 @@ public class ZstdIncrementalFrameDecompressor
         windowAddress = ARRAY_BYTE_BASE_OFFSET;
         windowPosition = ARRAY_BYTE_BASE_OFFSET;
         windowLimit = ARRAY_BYTE_BASE_OFFSET;
-        if (window.length > 0) {
+        if (window.length > 0 && AircompressorConfig.isZstdMemoryReuse()) {
             // the most recent window replaces the spare (streams opened next are likely alike)
             SPARE_WINDOW.set(new SoftReference<>(window));
         }
+    }
+
+    // drops the spare window (ZstdMemory.release())
+    static void clearSpareWindow()
+    {
+        SPARE_WINDOW.set(null);
     }
     private long windowAddress = ARRAY_BYTE_BASE_OFFSET;
     private long windowLimit = ARRAY_BYTE_BASE_OFFSET;
@@ -379,7 +387,7 @@ public class ZstdIncrementalFrameDecompressor
                     }
                     checkState(windowContentsSize + maxBlockOutput <= newWindowSize, "Computed new window size buffer is not large enough");
                 }
-                SoftReference<byte[]> spare = windowContentsSize == 0 ? SPARE_WINDOW.getAndSet(null) : null;
+                SoftReference<byte[]> spare = windowContentsSize == 0 && AircompressorConfig.isZstdMemoryReuse() ? SPARE_WINDOW.getAndSet(null) : null;
                 byte[] spareWindow = spare == null ? null : spare.get();
                 // a spare larger than this frame could ever grow to (2x the exact size when the whole content
                 // is known) stays in the pool: a small stream doesn't pin a large buffer. Without the whole
