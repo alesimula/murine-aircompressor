@@ -15,6 +15,8 @@ package io.airlift.compress.zstd;
 
 import java.util.Arrays;
 
+import sun.misc.Unsafe;
+
 import static io.airlift.compress.UnsafeUtil.SPLIT_LONGS;
 import static io.airlift.compress.UnsafeUtil.UNSAFE;
 import static io.airlift.compress.zstd.BitInputStream.isEndOfStream;
@@ -41,7 +43,10 @@ class Huffman
     // table
     private int tableLog = -1;
     // symbol | numberOfBits << 8: one load per decoded symbol instead of two
-    private final short[] entries = new short[1 << MAX_TABLE_LOG];
+    // (now numberOfBits | symbol << 8 in an int: the fast 4-stream loop consumes a symbol by shifting its
+    // bit window by the whole entry, Java masks shift counts to the low 6 bits)
+    private static final long ARRAY_INT_BASE_OFFSET = UNSAFE.arrayBaseOffset(int[].class);
+    private final int[] entries = new int[1 << MAX_TABLE_LOG];
 
     private final FseTableReader reader = new FseTableReader();
     private final FiniteStateEntropy.Table fseTable = new FiniteStateEntropy.Table(MAX_FSE_TABLE_LOG);
@@ -53,12 +58,16 @@ class Huffman
 
     public int readTable(final Object inputBase, final long inputAddress, final int size)
     {
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
         Arrays.fill(ranks, 0);
         long input = inputAddress;
 
         // read table header
         verify(size > 0, input, "Not enough input bytes");
-        int inputSize = UNSAFE.getByte(inputBase, input++) & 0xFF;
+        int inputSize = unsafe.getByte(inputBase, input++) & 0xFF;
 
         int outputSize;
         if (inputSize >= 128) {
@@ -69,7 +78,7 @@ class Huffman
             verify(outputSize <= MAX_SYMBOL + 1, input, "Input is corrupted");
 
             for (int i = 0; i < outputSize; i += 2) {
-                int value = UNSAFE.getByte(inputBase, input + i / 2) & 0xFF;
+                int value = unsafe.getByte(inputBase, input + i / 2) & 0xFF;
                 weights[i] = (byte) (value >>> 4);
                 weights[i + 1] = (byte) (value & 0b1111);
             }
@@ -115,7 +124,7 @@ class Huffman
             int weight = weights[n];
             int length = (1 << weight) >> 1;  // TODO: 1 << (weight - 1) ??
 
-            short entry = (short) (n | (tableLog + 1 - weight) << 8);
+            int entry = (tableLog + 1 - weight) | n << 8;
             for (int i = ranks[weight]; i < ranks[weight] + length; i++) {
                 entries[i] = entry;
             }
@@ -129,6 +138,10 @@ class Huffman
 
     public void decodeSingleStream(final Object inputBase, final long inputAddress, final long inputLimit, final Object outputBase, final long outputAddress, final long outputLimit)
     {
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
         // ARM/ART: peekBits / peekBitsFast / verify are written out in this method. ART's inliner stops
         // inlining into a method once it passes ~1024 IR instructions (kMaximumNumberOfTotalInstructions;
         // only callees of <= 3 instructions still get inlined), and this method is past that, so each
@@ -140,7 +153,7 @@ class Huffman
         long currentAddress = scratch[1];
 
         int tableLog = this.tableLog;
-        short[] entries = this.entries;
+        int[] entries = this.entries;
 
         // 4 symbols at a time
         long output = outputAddress;
@@ -150,7 +163,7 @@ class Huffman
             // (>= 8 bytes left) is done here, the rest still goes through the call
             if (currentAddress >= inputAddress + SIZE_OF_LONG) {
                 currentAddress -= bitsConsumed >>> 3;
-                bits = (split ? ((UNSAFE.getInt(inputBase, currentAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, currentAddress + 4) << 32)) : UNSAFE.getLong(inputBase, currentAddress));
+                bits = (split ? ((unsafe.getInt(inputBase, currentAddress) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, currentAddress + 4) << 32)) : unsafe.getLong(inputBase, currentAddress));
                 bitsConsumed &= 0b111;
             }
             else {
@@ -167,14 +180,14 @@ class Huffman
             // symbols are collected in a register and written with one putInt - putByte is a JNI
             // call on ART builds that don't intrinsify it (pre-Android 15 ART module)
             int e0 = entries[(int) ((bits << bitsConsumed) >>> (64 - tableLog))];
-            bitsConsumed += e0 >>> 8;
+            bitsConsumed += e0 & 0xFF;
             int e1 = entries[(int) ((bits << bitsConsumed) >>> (64 - tableLog))];
-            bitsConsumed += e1 >>> 8;
+            bitsConsumed += e1 & 0xFF;
             int e2 = entries[(int) ((bits << bitsConsumed) >>> (64 - tableLog))];
-            bitsConsumed += e2 >>> 8;
+            bitsConsumed += e2 & 0xFF;
             int e3 = entries[(int) ((bits << bitsConsumed) >>> (64 - tableLog))];
-            bitsConsumed += e3 >>> 8;
-            UNSAFE.putInt(outputBase, output, (e0 & 0xFF) | (e1 & 0xFF) << 8 | (e2 & 0xFF) << 16 | e3 << 24);
+            bitsConsumed += e3 & 0xFF;
+            unsafe.putInt(outputBase, output, (e0 >>> 8) | (e1 & 0xFF00) | (e2 & 0xFF00) << 8 | (e3 & 0xFF00) << 16);
             output += SIZE_OF_INT;
         }
 
@@ -183,6 +196,11 @@ class Huffman
 
     public void decode4Streams(final Object inputBase, final long inputAddress, final long inputLimit, final Object outputBase, final long outputAddress, final long outputLimit)
     {
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
+        final long arrayIntBaseOffset = ARRAY_INT_BASE_OFFSET;
         // ARM/ART: peekBits / peekBitsFast / verify are written out in this method. ART's inliner stops
         // inlining into a method once it passes ~1024 IR instructions (kMaximumNumberOfTotalInstructions;
         // only callees of <= 3 instructions still get inlined), and this method is past that, so each
@@ -191,9 +209,9 @@ class Huffman
         verify(inputLimit - inputAddress >= 10, inputAddress, "Input is corrupted"); // jump table + 1 byte per stream
 
         long start1 = inputAddress + 3 * SIZE_OF_SHORT; // for the shorts we read below
-        long start2 = start1 + (UNSAFE.getShort(inputBase, inputAddress) & 0xFFFF);
-        long start3 = start2 + (UNSAFE.getShort(inputBase, inputAddress + 2) & 0xFFFF);
-        long start4 = start3 + (UNSAFE.getShort(inputBase, inputAddress + 4) & 0xFFFF);
+        long start2 = start1 + (unsafe.getShort(inputBase, inputAddress) & 0xFFFF);
+        long start3 = start2 + (unsafe.getShort(inputBase, inputAddress + 2) & 0xFFFF);
+        long start4 = start3 + (unsafe.getShort(inputBase, inputAddress + 4) & 0xFFFF);
 
         if (!(start2 < start3 && start3 < start4 && start4 < inputLimit)) {
             throw fail(inputAddress, "Input is corrupted");
@@ -229,68 +247,263 @@ class Huffman
 
         long fastOutputLimit = outputLimit - 7;
         int tableLog = this.tableLog;
-        short[] entries = this.entries;
+        int[] entries = this.entries;
+
+        // ---- begin fast 4-stream loop ----
+        // Like native zstd's HUF_decompress4X1_usingDTable_internal_fast: each bit window keeps its unread bits
+        // at the top with a sentinel 1-bit right below them, so shifting by the entry consumes the symbol and
+        // numberOfTrailingZeros is the number of bits consumed since the last refill. No bit counters, no
+        // bounds checks. An iteration reads <= 4 * 12 bits per stream, so a stream moves back by <= 6 bytes per
+        // refill; the runs below stop before any stream could pass its start, the checked loop finishes.
+        {
+            int fastShift = 64 - tableLog;
+            long iterations = (fastOutputLimit - output4 + 3) >> 2;
+            iterations = Math.min(iterations, (stream1currentAddress - start1) / 6);
+            iterations = Math.min(iterations, (stream2currentAddress - start2) / 6);
+            iterations = Math.min(iterations, (stream3currentAddress - start3) / 6);
+            iterations = Math.min(iterations, (stream4currentAddress - start4) / 6);
+            if (iterations > 0) {
+                // bits were loaded at currentAddress (streams are > 8 bytes here)
+                long window1 = (stream1bits | 1) << stream1bitsConsumed;
+                long window2 = (stream2bits | 1) << stream2bitsConsumed;
+                long window3 = (stream3bits | 1) << stream3bitsConsumed;
+                long window4 = (stream4bits | 1) << stream4bitsConsumed;
+                if (!split) {
+                    do {
+                        do {
+                            int e;
+                            e = unsafe.getInt(entries, arrayIntBaseOffset + ((window1 >>> fastShift) << 2));
+                            window1 <<= e;
+                            int out1 = e >>> 8;
+                            e = unsafe.getInt(entries, arrayIntBaseOffset + ((window2 >>> fastShift) << 2));
+                            window2 <<= e;
+                            int out2 = e >>> 8;
+                            e = unsafe.getInt(entries, arrayIntBaseOffset + ((window3 >>> fastShift) << 2));
+                            window3 <<= e;
+                            int out3 = e >>> 8;
+                            e = unsafe.getInt(entries, arrayIntBaseOffset + ((window4 >>> fastShift) << 2));
+                            window4 <<= e;
+                            int out4 = e >>> 8;
+                            e = unsafe.getInt(entries, arrayIntBaseOffset + ((window1 >>> fastShift) << 2));
+                            window1 <<= e;
+                            out1 |= e & 0xFF00;
+                            e = unsafe.getInt(entries, arrayIntBaseOffset + ((window2 >>> fastShift) << 2));
+                            window2 <<= e;
+                            out2 |= e & 0xFF00;
+                            e = unsafe.getInt(entries, arrayIntBaseOffset + ((window3 >>> fastShift) << 2));
+                            window3 <<= e;
+                            out3 |= e & 0xFF00;
+                            e = unsafe.getInt(entries, arrayIntBaseOffset + ((window4 >>> fastShift) << 2));
+                            window4 <<= e;
+                            out4 |= e & 0xFF00;
+                            e = unsafe.getInt(entries, arrayIntBaseOffset + ((window1 >>> fastShift) << 2));
+                            window1 <<= e;
+                            out1 |= (e & 0xFF00) << 8;
+                            e = unsafe.getInt(entries, arrayIntBaseOffset + ((window2 >>> fastShift) << 2));
+                            window2 <<= e;
+                            out2 |= (e & 0xFF00) << 8;
+                            e = unsafe.getInt(entries, arrayIntBaseOffset + ((window3 >>> fastShift) << 2));
+                            window3 <<= e;
+                            out3 |= (e & 0xFF00) << 8;
+                            e = unsafe.getInt(entries, arrayIntBaseOffset + ((window4 >>> fastShift) << 2));
+                            window4 <<= e;
+                            out4 |= (e & 0xFF00) << 8;
+                            e = unsafe.getInt(entries, arrayIntBaseOffset + ((window1 >>> fastShift) << 2));
+                            window1 <<= e;
+                            out1 |= (e & 0xFF00) << 16;
+                            e = unsafe.getInt(entries, arrayIntBaseOffset + ((window2 >>> fastShift) << 2));
+                            window2 <<= e;
+                            out2 |= (e & 0xFF00) << 16;
+                            e = unsafe.getInt(entries, arrayIntBaseOffset + ((window3 >>> fastShift) << 2));
+                            window3 <<= e;
+                            out3 |= (e & 0xFF00) << 16;
+                            e = unsafe.getInt(entries, arrayIntBaseOffset + ((window4 >>> fastShift) << 2));
+                            window4 <<= e;
+                            out4 |= (e & 0xFF00) << 16;
+                            unsafe.putInt(outputBase, output1, out1);
+                            unsafe.putInt(outputBase, output2, out2);
+                            unsafe.putInt(outputBase, output3, out3);
+                            unsafe.putInt(outputBase, output4, out4);
+                            output1 += SIZE_OF_INT;
+                            output2 += SIZE_OF_INT;
+                            output3 += SIZE_OF_INT;
+                            output4 += SIZE_OF_INT;
+                            int consumed1 = Long.numberOfTrailingZeros(window1);
+                            stream1currentAddress -= consumed1 >>> 3;
+                            window1 = (unsafe.getLong(inputBase, stream1currentAddress) | 1) << (consumed1 & 0b111);
+                            int consumed2 = Long.numberOfTrailingZeros(window2);
+                            stream2currentAddress -= consumed2 >>> 3;
+                            window2 = (unsafe.getLong(inputBase, stream2currentAddress) | 1) << (consumed2 & 0b111);
+                            int consumed3 = Long.numberOfTrailingZeros(window3);
+                            stream3currentAddress -= consumed3 >>> 3;
+                            window3 = (unsafe.getLong(inputBase, stream3currentAddress) | 1) << (consumed3 & 0b111);
+                            int consumed4 = Long.numberOfTrailingZeros(window4);
+                            stream4currentAddress -= consumed4 >>> 3;
+                            window4 = (unsafe.getLong(inputBase, stream4currentAddress) | 1) << (consumed4 & 0b111);
+                        }
+                        while (--iterations > 0);
+                        iterations = (fastOutputLimit - output4 + 3) >> 2;
+                        iterations = Math.min(iterations, (stream1currentAddress - start1) / 6);
+                        iterations = Math.min(iterations, (stream2currentAddress - start2) / 6);
+                        iterations = Math.min(iterations, (stream3currentAddress - start3) / 6);
+                        iterations = Math.min(iterations, (stream4currentAddress - start4) / 6);
+                    }
+                    while (iterations > 0);
+                }
+                else {
+                    do {
+                        do {
+                            int e;
+                            e = unsafe.getInt(entries, arrayIntBaseOffset + ((window1 >>> fastShift) << 2));
+                            window1 <<= e;
+                            int out1 = e >>> 8;
+                            e = unsafe.getInt(entries, arrayIntBaseOffset + ((window2 >>> fastShift) << 2));
+                            window2 <<= e;
+                            int out2 = e >>> 8;
+                            e = unsafe.getInt(entries, arrayIntBaseOffset + ((window3 >>> fastShift) << 2));
+                            window3 <<= e;
+                            int out3 = e >>> 8;
+                            e = unsafe.getInt(entries, arrayIntBaseOffset + ((window4 >>> fastShift) << 2));
+                            window4 <<= e;
+                            int out4 = e >>> 8;
+                            e = unsafe.getInt(entries, arrayIntBaseOffset + ((window1 >>> fastShift) << 2));
+                            window1 <<= e;
+                            out1 |= e & 0xFF00;
+                            e = unsafe.getInt(entries, arrayIntBaseOffset + ((window2 >>> fastShift) << 2));
+                            window2 <<= e;
+                            out2 |= e & 0xFF00;
+                            e = unsafe.getInt(entries, arrayIntBaseOffset + ((window3 >>> fastShift) << 2));
+                            window3 <<= e;
+                            out3 |= e & 0xFF00;
+                            e = unsafe.getInt(entries, arrayIntBaseOffset + ((window4 >>> fastShift) << 2));
+                            window4 <<= e;
+                            out4 |= e & 0xFF00;
+                            e = unsafe.getInt(entries, arrayIntBaseOffset + ((window1 >>> fastShift) << 2));
+                            window1 <<= e;
+                            out1 |= (e & 0xFF00) << 8;
+                            e = unsafe.getInt(entries, arrayIntBaseOffset + ((window2 >>> fastShift) << 2));
+                            window2 <<= e;
+                            out2 |= (e & 0xFF00) << 8;
+                            e = unsafe.getInt(entries, arrayIntBaseOffset + ((window3 >>> fastShift) << 2));
+                            window3 <<= e;
+                            out3 |= (e & 0xFF00) << 8;
+                            e = unsafe.getInt(entries, arrayIntBaseOffset + ((window4 >>> fastShift) << 2));
+                            window4 <<= e;
+                            out4 |= (e & 0xFF00) << 8;
+                            e = unsafe.getInt(entries, arrayIntBaseOffset + ((window1 >>> fastShift) << 2));
+                            window1 <<= e;
+                            out1 |= (e & 0xFF00) << 16;
+                            e = unsafe.getInt(entries, arrayIntBaseOffset + ((window2 >>> fastShift) << 2));
+                            window2 <<= e;
+                            out2 |= (e & 0xFF00) << 16;
+                            e = unsafe.getInt(entries, arrayIntBaseOffset + ((window3 >>> fastShift) << 2));
+                            window3 <<= e;
+                            out3 |= (e & 0xFF00) << 16;
+                            e = unsafe.getInt(entries, arrayIntBaseOffset + ((window4 >>> fastShift) << 2));
+                            window4 <<= e;
+                            out4 |= (e & 0xFF00) << 16;
+                            unsafe.putInt(outputBase, output1, out1);
+                            unsafe.putInt(outputBase, output2, out2);
+                            unsafe.putInt(outputBase, output3, out3);
+                            unsafe.putInt(outputBase, output4, out4);
+                            output1 += SIZE_OF_INT;
+                            output2 += SIZE_OF_INT;
+                            output3 += SIZE_OF_INT;
+                            output4 += SIZE_OF_INT;
+                            int consumed1 = Long.numberOfTrailingZeros(window1);
+                            stream1currentAddress -= consumed1 >>> 3;
+                            window1 = ((split ? ((unsafe.getInt(inputBase, stream1currentAddress) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, stream1currentAddress + 4) << 32)) : unsafe.getLong(inputBase, stream1currentAddress)) | 1) << (consumed1 & 0b111);
+                            int consumed2 = Long.numberOfTrailingZeros(window2);
+                            stream2currentAddress -= consumed2 >>> 3;
+                            window2 = ((split ? ((unsafe.getInt(inputBase, stream2currentAddress) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, stream2currentAddress + 4) << 32)) : unsafe.getLong(inputBase, stream2currentAddress)) | 1) << (consumed2 & 0b111);
+                            int consumed3 = Long.numberOfTrailingZeros(window3);
+                            stream3currentAddress -= consumed3 >>> 3;
+                            window3 = ((split ? ((unsafe.getInt(inputBase, stream3currentAddress) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, stream3currentAddress + 4) << 32)) : unsafe.getLong(inputBase, stream3currentAddress)) | 1) << (consumed3 & 0b111);
+                            int consumed4 = Long.numberOfTrailingZeros(window4);
+                            stream4currentAddress -= consumed4 >>> 3;
+                            window4 = ((split ? ((unsafe.getInt(inputBase, stream4currentAddress) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, stream4currentAddress + 4) << 32)) : unsafe.getLong(inputBase, stream4currentAddress)) | 1) << (consumed4 & 0b111);
+                        }
+                        while (--iterations > 0);
+                        iterations = (fastOutputLimit - output4 + 3) >> 2;
+                        iterations = Math.min(iterations, (stream1currentAddress - start1) / 6);
+                        iterations = Math.min(iterations, (stream2currentAddress - start2) / 6);
+                        iterations = Math.min(iterations, (stream3currentAddress - start3) / 6);
+                        iterations = Math.min(iterations, (stream4currentAddress - start4) / 6);
+                    }
+                    while (iterations > 0);
+                }
+                stream1bitsConsumed = Long.numberOfTrailingZeros(window1);
+                stream2bitsConsumed = Long.numberOfTrailingZeros(window2);
+                stream3bitsConsumed = Long.numberOfTrailingZeros(window3);
+                stream4bitsConsumed = Long.numberOfTrailingZeros(window4);
+                stream1bits = (split ? ((unsafe.getInt(inputBase, stream1currentAddress) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, stream1currentAddress + 4) << 32)) : unsafe.getLong(inputBase, stream1currentAddress));
+                stream2bits = (split ? ((unsafe.getInt(inputBase, stream2currentAddress) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, stream2currentAddress + 4) << 32)) : unsafe.getLong(inputBase, stream2currentAddress));
+                stream3bits = (split ? ((unsafe.getInt(inputBase, stream3currentAddress) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, stream3currentAddress + 4) << 32)) : unsafe.getLong(inputBase, stream3currentAddress));
+                stream4bits = (split ? ((unsafe.getInt(inputBase, stream4currentAddress) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, stream4currentAddress + 4) << 32)) : unsafe.getLong(inputBase, stream4currentAddress));
+            }
+        }
+        // ---- end fast 4-stream loop ----
 
         while (output4 < fastOutputLimit) {
             // ARM/ART: 4 symbols per stream, each stream's bytes collected in a register and written
             // with one putInt (see decodeSingleStream); entry = symbol | numberOfBits << 8
             int e;
             e = entries[(int) ((stream1bits << stream1bitsConsumed) >>> (64 - tableLog))];
-            stream1bitsConsumed += e >>> 8;
-            int out1 = e & 0xFF;
+            stream1bitsConsumed += e & 0xFF;
+            int out1 = e >>> 8;
             e = entries[(int) ((stream2bits << stream2bitsConsumed) >>> (64 - tableLog))];
-            stream2bitsConsumed += e >>> 8;
-            int out2 = e & 0xFF;
+            stream2bitsConsumed += e & 0xFF;
+            int out2 = e >>> 8;
             e = entries[(int) ((stream3bits << stream3bitsConsumed) >>> (64 - tableLog))];
-            stream3bitsConsumed += e >>> 8;
-            int out3 = e & 0xFF;
+            stream3bitsConsumed += e & 0xFF;
+            int out3 = e >>> 8;
             e = entries[(int) ((stream4bits << stream4bitsConsumed) >>> (64 - tableLog))];
-            stream4bitsConsumed += e >>> 8;
-            int out4 = e & 0xFF;
+            stream4bitsConsumed += e & 0xFF;
+            int out4 = e >>> 8;
 
             e = entries[(int) ((stream1bits << stream1bitsConsumed) >>> (64 - tableLog))];
-            stream1bitsConsumed += e >>> 8;
-            out1 |= (e & 0xFF) << 8;
+            stream1bitsConsumed += e & 0xFF;
+            out1 |= e & 0xFF00;
             e = entries[(int) ((stream2bits << stream2bitsConsumed) >>> (64 - tableLog))];
-            stream2bitsConsumed += e >>> 8;
-            out2 |= (e & 0xFF) << 8;
+            stream2bitsConsumed += e & 0xFF;
+            out2 |= e & 0xFF00;
             e = entries[(int) ((stream3bits << stream3bitsConsumed) >>> (64 - tableLog))];
-            stream3bitsConsumed += e >>> 8;
-            out3 |= (e & 0xFF) << 8;
+            stream3bitsConsumed += e & 0xFF;
+            out3 |= e & 0xFF00;
             e = entries[(int) ((stream4bits << stream4bitsConsumed) >>> (64 - tableLog))];
-            stream4bitsConsumed += e >>> 8;
-            out4 |= (e & 0xFF) << 8;
+            stream4bitsConsumed += e & 0xFF;
+            out4 |= e & 0xFF00;
 
             e = entries[(int) ((stream1bits << stream1bitsConsumed) >>> (64 - tableLog))];
-            stream1bitsConsumed += e >>> 8;
-            out1 |= (e & 0xFF) << 16;
+            stream1bitsConsumed += e & 0xFF;
+            out1 |= (e & 0xFF00) << 8;
             e = entries[(int) ((stream2bits << stream2bitsConsumed) >>> (64 - tableLog))];
-            stream2bitsConsumed += e >>> 8;
-            out2 |= (e & 0xFF) << 16;
+            stream2bitsConsumed += e & 0xFF;
+            out2 |= (e & 0xFF00) << 8;
             e = entries[(int) ((stream3bits << stream3bitsConsumed) >>> (64 - tableLog))];
-            stream3bitsConsumed += e >>> 8;
-            out3 |= (e & 0xFF) << 16;
+            stream3bitsConsumed += e & 0xFF;
+            out3 |= (e & 0xFF00) << 8;
             e = entries[(int) ((stream4bits << stream4bitsConsumed) >>> (64 - tableLog))];
-            stream4bitsConsumed += e >>> 8;
-            out4 |= (e & 0xFF) << 16;
+            stream4bitsConsumed += e & 0xFF;
+            out4 |= (e & 0xFF00) << 8;
 
             e = entries[(int) ((stream1bits << stream1bitsConsumed) >>> (64 - tableLog))];
-            stream1bitsConsumed += e >>> 8;
-            out1 |= e << 24;
+            stream1bitsConsumed += e & 0xFF;
+            out1 |= (e & 0xFF00) << 16;
             e = entries[(int) ((stream2bits << stream2bitsConsumed) >>> (64 - tableLog))];
-            stream2bitsConsumed += e >>> 8;
-            out2 |= e << 24;
+            stream2bitsConsumed += e & 0xFF;
+            out2 |= (e & 0xFF00) << 16;
             e = entries[(int) ((stream3bits << stream3bitsConsumed) >>> (64 - tableLog))];
-            stream3bitsConsumed += e >>> 8;
-            out3 |= e << 24;
+            stream3bitsConsumed += e & 0xFF;
+            out3 |= (e & 0xFF00) << 16;
             e = entries[(int) ((stream4bits << stream4bitsConsumed) >>> (64 - tableLog))];
-            stream4bitsConsumed += e >>> 8;
-            out4 |= e << 24;
+            stream4bitsConsumed += e & 0xFF;
+            out4 |= (e & 0xFF00) << 16;
 
-            UNSAFE.putInt(outputBase, output1, out1);
-            UNSAFE.putInt(outputBase, output2, out2);
-            UNSAFE.putInt(outputBase, output3, out3);
-            UNSAFE.putInt(outputBase, output4, out4);
+            unsafe.putInt(outputBase, output1, out1);
+            unsafe.putInt(outputBase, output2, out2);
+            unsafe.putInt(outputBase, output3, out3);
+            unsafe.putInt(outputBase, output4, out4);
 
             output1 += SIZE_OF_INT;
             output2 += SIZE_OF_INT;
@@ -300,7 +513,7 @@ class Huffman
             // ARM/ART: common case of BitInputStream.loadBits inlined per stream (see decodeSingleStream)
             if (stream1currentAddress >= start1 + SIZE_OF_LONG) {
                 stream1currentAddress -= stream1bitsConsumed >>> 3;
-                stream1bits = (split ? ((UNSAFE.getInt(inputBase, stream1currentAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, stream1currentAddress + 4) << 32)) : UNSAFE.getLong(inputBase, stream1currentAddress));
+                stream1bits = (split ? ((unsafe.getInt(inputBase, stream1currentAddress) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, stream1currentAddress + 4) << 32)) : unsafe.getLong(inputBase, stream1currentAddress));
                 stream1bitsConsumed &= 0b111;
             }
             else {
@@ -315,7 +528,7 @@ class Huffman
 
             if (stream2currentAddress >= start2 + SIZE_OF_LONG) {
                 stream2currentAddress -= stream2bitsConsumed >>> 3;
-                stream2bits = (split ? ((UNSAFE.getInt(inputBase, stream2currentAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, stream2currentAddress + 4) << 32)) : UNSAFE.getLong(inputBase, stream2currentAddress));
+                stream2bits = (split ? ((unsafe.getInt(inputBase, stream2currentAddress) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, stream2currentAddress + 4) << 32)) : unsafe.getLong(inputBase, stream2currentAddress));
                 stream2bitsConsumed &= 0b111;
             }
             else {
@@ -330,7 +543,7 @@ class Huffman
 
             if (stream3currentAddress >= start3 + SIZE_OF_LONG) {
                 stream3currentAddress -= stream3bitsConsumed >>> 3;
-                stream3bits = (split ? ((UNSAFE.getInt(inputBase, stream3currentAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, stream3currentAddress + 4) << 32)) : UNSAFE.getLong(inputBase, stream3currentAddress));
+                stream3bits = (split ? ((unsafe.getInt(inputBase, stream3currentAddress) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, stream3currentAddress + 4) << 32)) : unsafe.getLong(inputBase, stream3currentAddress));
                 stream3bitsConsumed &= 0b111;
             }
             else {
@@ -345,7 +558,7 @@ class Huffman
 
             if (stream4currentAddress >= start4 + SIZE_OF_LONG) {
                 stream4currentAddress -= stream4bitsConsumed >>> 3;
-                stream4bits = (split ? ((UNSAFE.getInt(inputBase, stream4currentAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, stream4currentAddress + 4) << 32)) : UNSAFE.getLong(inputBase, stream4currentAddress));
+                stream4bits = (split ? ((unsafe.getInt(inputBase, stream4currentAddress) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, stream4currentAddress + 4) << 32)) : unsafe.getLong(inputBase, stream4currentAddress));
                 stream4bitsConsumed &= 0b111;
             }
             else {
@@ -372,9 +585,13 @@ class Huffman
 
     private void decodeTail(final Object inputBase, final long startAddress, long currentAddress, int bitsConsumed, long bits, final Object outputBase, long outputAddress, final long outputLimit)
     {
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
         long[] scratch = new long[2]; // one per call; refills below are allocation-free
         int tableLog = this.tableLog;
-        short[] entries = this.entries;
+        int[] entries = this.entries;
 
         // closer to the end
         while (outputAddress < outputLimit) {
@@ -387,15 +604,15 @@ class Huffman
             }
 
             int e = entries[(int) ((bits << bitsConsumed) >>> (64 - tableLog))];
-            UNSAFE.putByte(outputBase, outputAddress++, (byte) e);
-            bitsConsumed += e >>> 8;
+            unsafe.putByte(outputBase, outputAddress++, (byte) (e >>> 8));
+            bitsConsumed += e & 0xFF;
         }
 
         // not more data in bit stream, so no need to reload
         while (outputAddress < outputLimit) {
             int e = entries[(int) ((bits << bitsConsumed) >>> (64 - tableLog))];
-            UNSAFE.putByte(outputBase, outputAddress++, (byte) e);
-            bitsConsumed += e >>> 8;
+            unsafe.putByte(outputBase, outputAddress++, (byte) (e >>> 8));
+            bitsConsumed += e & 0xFF;
         }
 
         verify(isEndOfStream(startAddress, currentAddress, bitsConsumed), startAddress, "Bit stream is not fully consumed");
