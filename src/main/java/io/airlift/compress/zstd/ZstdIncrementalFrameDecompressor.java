@@ -15,7 +15,11 @@ package io.airlift.compress.zstd;
 
 import io.airlift.compress.MalformedInputException;
 
+import java.lang.ref.SoftReference;
 import java.util.Arrays;
+import java.util.concurrent.atomic.AtomicReference;
+
+import sun.misc.Unsafe;
 
 import static io.airlift.compress.UnsafeUtil.ARRAY_BYTE_BASE_OFFSET;
 import static io.airlift.compress.UnsafeUtil.UNSAFE;
@@ -65,6 +69,25 @@ public class ZstdIncrementalFrameDecompressor
 
     // current window buffer
     private byte[] windowBase = new byte[0];
+
+    // One spare window buffer left by a closed stream (see release()). A new stream takes it instead of
+    // allocating, zeroing and then growing a multi-megabyte array by doubling (like zstd-jni's
+    // RecyclingBufferPool). Soft reference: the GC can drop it under memory pressure.
+    private static final AtomicReference<SoftReference<byte[]>> SPARE_WINDOW = new AtomicReference<>();
+
+    // stream closed: hand the window buffer to the next stream
+    void release()
+    {
+        byte[] window = windowBase;
+        windowBase = new byte[0];
+        windowAddress = ARRAY_BYTE_BASE_OFFSET;
+        windowPosition = ARRAY_BYTE_BASE_OFFSET;
+        windowLimit = ARRAY_BYTE_BASE_OFFSET;
+        if (window.length > 0) {
+            // the most recent window replaces the spare (streams opened next are likely alike)
+            SPARE_WINDOW.set(new SoftReference<>(window));
+        }
+    }
     private long windowAddress = ARRAY_BYTE_BASE_OFFSET;
     private long windowLimit = ARRAY_BYTE_BASE_OFFSET;
     private long windowPosition = ARRAY_BYTE_BASE_OFFSET;
@@ -104,6 +127,10 @@ public class ZstdIncrementalFrameDecompressor
             final int outputOffset,
             final int outputLimit)
     {
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
         if (inputRequired > inputLimit - inputAddress) {
             throw new IllegalArgumentException(format(
                     "Required %s input bytes, but only %s input bytes were supplied",
@@ -182,12 +209,12 @@ public class ZstdIncrementalFrameDecompressor
                     return;
                 }
                 if (inputBufferSize >= SIZE_OF_INT) {
-                    blockHeader = UNSAFE.getInt(inputBase, input) & 0xFF_FFFF;
+                    blockHeader = unsafe.getInt(inputBase, input) & 0xFF_FFFF;
                 }
                 else {
-                    blockHeader = UNSAFE.getByte(inputBase, input) & 0xFF |
-                            (UNSAFE.getByte(inputBase, input + 1) & 0xFF) << 8 |
-                            (UNSAFE.getByte(inputBase, input + 2) & 0xFF) << 16;
+                    blockHeader = unsafe.getByte(inputBase, input) & 0xFF |
+                            (unsafe.getByte(inputBase, input + 1) & 0xFF) << 8 |
+                            (unsafe.getByte(inputBase, input + 2) & 0xFF) << 16;
                 }
                 input += SIZE_OF_BLOCK_HEADER;
                 state = State.READ_BLOCK;
@@ -255,7 +282,7 @@ public class ZstdIncrementalFrameDecompressor
                     }
 
                     // read checksum
-                    int checksum = UNSAFE.getInt(inputBase, input);
+                    int checksum = unsafe.getInt(inputBase, input);
                     input += SIZE_OF_INT;
 
                     checkState(partialHash != null, "Partial hash not set");
@@ -320,23 +347,59 @@ public class ZstdIncrementalFrameDecompressor
             // if window free space is still too small, grow array
             if (windowLimit - windowPosition < maxBlockOutput) {
                 // if content size is set and smaller than the required window size, use the content size
+                // requiredWindowSize is min(windowSize, contentSize), so the check above never held and
+                // frames with a known content size doubled up from 256 KB, copying the whole buffer at
+                // every step. With the content size known, allocate the final buffer once: the whole
+                // content plus one block of slack (so the last block never forces one more grow), capped
+                // like the doubling below. A header lying about the content size falls through to the doubling.
+                // Only when the whole content fits in the window: a larger content is decoded through the
+                // window with the doubling below, which stays near 2x the window instead of the 4x cap.
+                int maxWindowSize = min(max(requiredWindowSize, MAX_BLOCK_SIZE) * 4, MAX_WINDOW_SIZE + MAX_BLOCK_SIZE);
+                int settledWindowSize = min(requiredWindowSize + requiredWindowSize / 2 + MAX_BLOCK_SIZE, maxWindowSize);
+                boolean wholeContent = frameHeader.contentSize >= 0 && frameHeader.contentSize <= requiredWindowSize && windowContentsSize + maxBlockOutput <= frameHeader.contentSize + MAX_BLOCK_SIZE;
                 int newWindowSize;
-                if (frameHeader.contentSize >= 0 && frameHeader.contentSize < requiredWindowSize) {
-                    newWindowSize = toIntExact(frameHeader.contentSize);
+                if (wholeContent) {
+                    newWindowSize = toIntExact(min(frameHeader.contentSize + MAX_BLOCK_SIZE, maxWindowSize));
+                    newWindowSize = max(windowContentsSize + maxBlockOutput, newWindowSize);
                 }
                 else {
                     // double the current necessary window size
                     newWindowSize = (windowContentsSize + maxBlockOutput) * 2;
                     // limit to 4x the required window size (or block size if larger)
-                    newWindowSize = min(newWindowSize, max(requiredWindowSize, MAX_BLOCK_SIZE) * 4);
-                    // limit to the max window size with one max sized block
-                    newWindowSize = min(newWindowSize, MAX_WINDOW_SIZE + MAX_BLOCK_SIZE);
+                    newWindowSize = min(newWindowSize, maxWindowSize);
+                    // limit to the max window size with one max sized block (part of maxWindowSize)
                     // must allocate at least enough space for a max sized block
                     newWindowSize = max(windowContentsSize + maxBlockOutput, newWindowSize);
+                    // a buffer of one window plus a block never grows again; just above that, every move to
+                    // the front copies a whole window to free a block or two, so settle at 1.5 windows instead
+                    // (doubling from empty with full blocks ends near 2 windows and never lands here, a buffer
+                    // grown from a pooled spare can)
+                    if (newWindowSize >= requiredWindowSize + MAX_BLOCK_SIZE && newWindowSize < settledWindowSize) {
+                        newWindowSize = settledWindowSize;
+                    }
                     checkState(windowContentsSize + maxBlockOutput <= newWindowSize, "Computed new window size buffer is not large enough");
                 }
-                windowBase = Arrays.copyOf(windowBase, newWindowSize);
-                windowLimit = newWindowSize + ARRAY_BYTE_BASE_OFFSET;
+                SoftReference<byte[]> spare = windowContentsSize == 0 ? SPARE_WINDOW.getAndSet(null) : null;
+                byte[] spareWindow = spare == null ? null : spare.get();
+                // a spare larger than this frame could ever grow to (2x the exact size when the whole content
+                // is known) stays in the pool: a small stream doesn't pin a large buffer. Without the whole
+                // content, a spare between one window plus a block and 1.5 windows is skipped too: it would
+                // never grow and move the whole window to the front every block or two (see settledWindowSize)
+                int spareMax = wholeContent ? 2 * newWindowSize : maxWindowSize;
+                boolean spareUnsettled = !wholeContent && spareWindow != null
+                        && spareWindow.length >= requiredWindowSize + MAX_BLOCK_SIZE && spareWindow.length < settledWindowSize;
+                if (spareWindow != null && spareWindow.length >= newWindowSize && spareWindow.length <= spareMax && !spareUnsettled) {
+                    // empty window: the spare's old contents are never read (matches only reach back into
+                    // output of this frame), so it needs no zeroing
+                    windowBase = spareWindow;
+                }
+                else {
+                    if (spareWindow != null) {
+                        SPARE_WINDOW.compareAndSet(null, spare);
+                    }
+                    windowBase = Arrays.copyOf(windowBase, newWindowSize);
+                }
+                windowLimit = windowBase.length + ARRAY_BYTE_BASE_OFFSET;
             }
 
             checkState(windowLimit - windowPosition >= maxBlockOutput, "window buffer is too small");
@@ -345,9 +408,13 @@ public class ZstdIncrementalFrameDecompressor
 
     private static int determineFrameHeaderSize(final Object inputBase, final long inputAddress, final long inputLimit)
     {
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
         verify(inputAddress < inputLimit, inputAddress, "Not enough input bytes");
 
-        int frameHeaderDescriptor = UNSAFE.getByte(inputBase, inputAddress) & 0xFF;
+        int frameHeaderDescriptor = unsafe.getByte(inputBase, inputAddress) & 0xFF;
         boolean singleSegment = (frameHeaderDescriptor & 0b100000) != 0;
         int dictionaryDescriptor = frameHeaderDescriptor & 0b11;
         int contentSizeDescriptor = frameHeaderDescriptor >>> 6;

@@ -145,6 +145,7 @@ public class ZstdInputStream
     {
         if (!closed) {
             closed = true;
+            decompressor.release();
             inputStream.close();
         }
     }
