@@ -28,6 +28,14 @@ class HuffmanCompressionContext
     private HuffmanCompressionTable previousCandidate = previousTable;
     private HuffmanCompressionTable temporaryCandidate = temporaryTable;
 
+    // as new: no previous table to reuse (a new frame has none)
+    public void reset()
+    {
+        previousTable.invalidate();
+        previousCandidate = previousTable;
+        temporaryCandidate = temporaryTable;
+    }
+
     public HuffmanCompressionTable getPreviousTable()
     {
         return previousTable;

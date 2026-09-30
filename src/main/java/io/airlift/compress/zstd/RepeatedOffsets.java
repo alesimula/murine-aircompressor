@@ -41,6 +41,15 @@ class RepeatedOffsets
         tempOffset1 = offset;
     }
 
+    // as new
+    public void reset()
+    {
+        offset0 = 1;
+        offset1 = 4;
+        tempOffset0 = 0;
+        tempOffset1 = 0;
+    }
+
     public void commit()
     {
         offset0 = tempOffset0;

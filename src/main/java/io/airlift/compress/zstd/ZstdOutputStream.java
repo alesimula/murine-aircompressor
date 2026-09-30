@@ -128,7 +128,7 @@ public class ZstdOutputStream
         this.ringMode = bufferMode == BufferMode.RING_BUFFER;
         CompressionParameters parameters = CompressionParameters.compute(compressionLevel, -1);
         CompressionParameters.checkLevelSupported(parameters, compressionLevel);
-        this.context = new CompressionContext(parameters, ARRAY_BYTE_BASE_OFFSET, Integer.MAX_VALUE);
+        this.context = CompressionContext.acquire(parameters, ARRAY_BYTE_BASE_OFFSET, Integer.MAX_VALUE);
         this.windowSize = parameters.getWindowSize();
         this.blockSize = parameters.getBlockSize();
 
@@ -185,6 +185,7 @@ public class ZstdOutputStream
             return this;
         }
         closed = true; // consume this instance; the returned stream owns the underlying output
+        context.release();
         return new ZstdParallelOutputStream(outputStream, compressionLevel, windowSlideMode, bufferMode, workerThreads, chunkSize);
     }
 
@@ -290,6 +291,7 @@ public class ZstdOutputStream
                 writeChunk(true);
             }
             closed = true;
+            context.release();
         }
     }
 
@@ -306,6 +308,7 @@ public class ZstdOutputStream
             }
 
             closed = true;
+            context.release();
             outputStream.close();
         }
     }
