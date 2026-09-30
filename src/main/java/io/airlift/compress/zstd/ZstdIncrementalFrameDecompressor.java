@@ -15,12 +15,11 @@ package io.airlift.compress.zstd;
 
 import io.airlift.compress.AircompressorConfig;
 import io.airlift.compress.MalformedInputException;
+import sun.misc.Unsafe;
 
 import java.lang.ref.SoftReference;
 import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicReference;
-
-import sun.misc.Unsafe;
 
 import static io.airlift.compress.UnsafeUtil.ARRAY_BYTE_BASE_OFFSET;
 import static io.airlift.compress.UnsafeUtil.UNSAFE;
@@ -96,6 +95,7 @@ public class ZstdIncrementalFrameDecompressor
     {
         SPARE_WINDOW.set(null);
     }
+
     private long windowAddress = ARRAY_BYTE_BASE_OFFSET;
     private long windowLimit = ARRAY_BYTE_BASE_OFFSET;
     private long windowPosition = ARRAY_BYTE_BASE_OFFSET;

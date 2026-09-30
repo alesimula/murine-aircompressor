@@ -14,10 +14,9 @@
 package io.airlift.compress.zstd;
 
 import io.airlift.compress.MalformedInputException;
+import sun.misc.Unsafe;
 
 import java.util.Arrays;
-
-import sun.misc.Unsafe;
 
 import static io.airlift.compress.UnsafeUtil.ARRAY_BYTE_BASE_OFFSET;
 import static io.airlift.compress.UnsafeUtil.SPLIT_LONGS;
@@ -1238,7 +1237,6 @@ class ZstdFrameDecompressor
                 numberOfBits = ((int) offsetCodesEntry >>> 16) & 0xFF;
                 offsetCodesState = (offsetCodesEntry & 0xFFFF) + ((((bits << bitsConsumed) >>> 1) >>> (63 - numberOfBits)) << 3); // <= 8 bits
                 bitsConsumed += numberOfBits;
-
             }
             final long literalOutputLimit = output + literalsLength;
             final long matchOutputLimit = literalOutputLimit + matchLength;

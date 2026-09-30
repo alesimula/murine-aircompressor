@@ -13,9 +13,9 @@
  */
 package io.airlift.compress.zstd;
 
-import java.util.Arrays;
-
 import sun.misc.Unsafe;
+
+import java.util.Arrays;
 
 import static io.airlift.compress.UnsafeUtil.UNSAFE;
 import static io.airlift.compress.zstd.Huffman.MAX_FSE_TABLE_LOG;

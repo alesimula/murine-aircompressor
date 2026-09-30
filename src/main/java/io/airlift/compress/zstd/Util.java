@@ -14,7 +14,6 @@
 package io.airlift.compress.zstd;
 
 import io.airlift.compress.MalformedInputException;
-
 import sun.misc.Unsafe;
 
 import static io.airlift.compress.UnsafeUtil.UNSAFE;

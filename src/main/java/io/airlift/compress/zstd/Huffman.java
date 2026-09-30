@@ -13,9 +13,9 @@
  */
 package io.airlift.compress.zstd;
 
-import java.util.Arrays;
-
 import sun.misc.Unsafe;
+
+import java.util.Arrays;
 
 import static io.airlift.compress.UnsafeUtil.SPLIT_LONGS;
 import static io.airlift.compress.UnsafeUtil.UNSAFE;

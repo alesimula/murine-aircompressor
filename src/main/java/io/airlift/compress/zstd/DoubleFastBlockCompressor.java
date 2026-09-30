@@ -193,7 +193,6 @@ class DoubleFastBlockCompressor
         final Unsafe unsafe = UNSAFE;
         int matchSearchLength = Math.max(parameters.getSearchLength(), 4);
 
-
         final long baseAddress = state.getBaseAddress();
         final long windowBaseAddress = baseAddress + state.getWindowBaseOffset();
         final long inputEnd = inputAddress + inputSize;

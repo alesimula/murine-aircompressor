@@ -161,7 +161,6 @@ class FastBlockCompressor
         int matchSearchLength = Math.max(parameters.getSearchLength(), 4);
         int hashBits = parameters.getHashLog();
 
-
         final long baseAddress = state.getBaseAddress();
         final long windowBaseAddress = baseAddress + state.getWindowBaseOffset();
         final long inputEnd = inputAddress + inputSize;

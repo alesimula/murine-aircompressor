@@ -13,10 +13,10 @@
  */
 package io.airlift.compress.zstd;
 
+import sun.misc.Unsafe;
+
 import java.io.IOException;
 import java.io.InputStream;
-
-import sun.misc.Unsafe;
 
 import static io.airlift.compress.UnsafeUtil.ARRAY_BYTE_BASE_OFFSET;
 import static io.airlift.compress.UnsafeUtil.SPLIT_LONGS;
