@@ -13,6 +13,8 @@
  */
 package io.airlift.compress.zstd;
 
+import sun.misc.Unsafe;
+
 import static io.airlift.compress.UnsafeUtil.SPLIT_LONGS;
 import static io.airlift.compress.UnsafeUtil.UNSAFE;
 import static io.airlift.compress.zstd.Constants.SIZE_OF_LONG;
@@ -20,12 +22,18 @@ import static io.airlift.compress.zstd.Constants.SIZE_OF_SHORT;
 
 class HuffmanCompressor
 {
+    private static final long ARRAY_LONG_BASE_OFFSET = UNSAFE.arrayBaseOffset(long[].class);
+
     private HuffmanCompressor()
     {
     }
 
     public static int compress4streams(Object outputBase, long outputAddress, int outputSize, Object inputBase, long inputAddress, int inputSize, HuffmanCompressionTable table)
     {
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
         long input = inputAddress;
         long inputLimit = inputAddress + inputSize;
         long output = outputAddress;
@@ -50,7 +58,7 @@ class HuffmanCompressor
         if (compressedSize == 0) {
             return 0;
         }
-        UNSAFE.putShort(outputBase, outputAddress, (short) compressedSize);
+        unsafe.putShort(outputBase, outputAddress, (short) compressedSize);
         output += compressedSize;
         input += segmentSize;
 
@@ -59,7 +67,7 @@ class HuffmanCompressor
         if (compressedSize == 0) {
             return 0;
         }
-        UNSAFE.putShort(outputBase, outputAddress + SIZE_OF_SHORT, (short) compressedSize);
+        unsafe.putShort(outputBase, outputAddress + SIZE_OF_SHORT, (short) compressedSize);
         output += compressedSize;
         input += segmentSize;
 
@@ -68,7 +76,7 @@ class HuffmanCompressor
         if (compressedSize == 0) {
             return 0;
         }
-        UNSAFE.putShort(outputBase, outputAddress + SIZE_OF_SHORT + SIZE_OF_SHORT, (short) compressedSize);
+        unsafe.putShort(outputBase, outputAddress + SIZE_OF_SHORT + SIZE_OF_SHORT, (short) compressedSize);
         output += compressedSize;
         input += segmentSize;
 
@@ -84,7 +92,14 @@ class HuffmanCompressor
 
     public static int compressSingleStream(Object outputBase, long outputAddress, int outputSize, Object inputBase, long inputAddress, int inputSize, HuffmanCompressionTable table)
     {
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
         final boolean split = SPLIT_LONGS;
+        if (!split) {
+            return compressSingleStream64(outputBase, outputAddress, outputSize, inputBase, inputAddress, inputSize, table);
+        }
         if (outputSize < SIZE_OF_LONG) {
             return 0;
         }
@@ -107,30 +122,30 @@ class HuffmanCompressor
 
         switch (inputSize & 3) {
             case 3:
-                symbol = UNSAFE.getByte(inputBase, input + n + 2) & 0xFF;
+                symbol = unsafe.getByte(inputBase, input + n + 2) & 0xFF;
                 entry = entries[symbol];
                 container |= ((long) (entry & 0xFFFF)) << bitCount;
                 bitCount += entry >>> 16;
                 // fall-through
             case 2:
-                symbol = UNSAFE.getByte(inputBase, input + n + 1) & 0xFF;
+                symbol = unsafe.getByte(inputBase, input + n + 1) & 0xFF;
                 entry = entries[symbol];
                 container |= ((long) (entry & 0xFFFF)) << bitCount;
                 bitCount += entry >>> 16;
                 // fall-through
             case 1:
-                symbol = UNSAFE.getByte(inputBase, input + n + 0) & 0xFF;
+                symbol = unsafe.getByte(inputBase, input + n + 0) & 0xFF;
                 entry = entries[symbol];
                 container |= ((long) (entry & 0xFFFF)) << bitCount;
                 bitCount += entry >>> 16;
                 // flush
                 flushedBytes = bitCount >>> 3;
                 if (split) {
-                    UNSAFE.putInt(outputBase, currentAddress, (int) container);
-                    UNSAFE.putInt(outputBase, currentAddress + 4, (int) (container >>> 32));
+                    unsafe.putInt(outputBase, currentAddress, (int) container);
+                    unsafe.putInt(outputBase, currentAddress + 4, (int) (container >>> 32));
                 }
                 else {
-                    UNSAFE.putLong(outputBase, currentAddress, container);
+                    unsafe.putLong(outputBase, currentAddress, container);
                 }
                 currentAddress += flushedBytes;
                 if (currentAddress > bosLimit) {
@@ -147,7 +162,7 @@ class HuffmanCompressor
         for (; n > 0; n -= 4) {  // note: n & 3 == 0 at this stage
             // ARM/ART: one getInt for the 4 symbols (little endian: byte n-1 is the top byte);
             // getByte is a JNI call on ART builds that don't intrinsify it
-            int four = UNSAFE.getInt(inputBase, input + n - 4);
+            int four = unsafe.getInt(inputBase, input + n - 4);
             symbol = four >>> 24;
             entry = entries[symbol];
             container |= ((long) (entry & 0xFFFF)) << bitCount;
@@ -167,11 +182,11 @@ class HuffmanCompressor
             // flush
             flushedBytes = bitCount >>> 3;
             if (split) {
-                UNSAFE.putInt(outputBase, currentAddress, (int) container);
-                UNSAFE.putInt(outputBase, currentAddress + 4, (int) (container >>> 32));
+                unsafe.putInt(outputBase, currentAddress, (int) container);
+                unsafe.putInt(outputBase, currentAddress + 4, (int) (container >>> 32));
             }
             else {
-                UNSAFE.putLong(outputBase, currentAddress, container);
+                unsafe.putLong(outputBase, currentAddress, container);
             }
             currentAddress += flushedBytes;
             if (currentAddress > bosLimit) {
@@ -186,12 +201,111 @@ class HuffmanCompressor
         bitCount += 1;
         flushedBytes = bitCount >>> 3;
         if (split) {
-            UNSAFE.putInt(outputBase, currentAddress, (int) container);
-            UNSAFE.putInt(outputBase, currentAddress + 4, (int) (container >>> 32));
+            unsafe.putInt(outputBase, currentAddress, (int) container);
+            unsafe.putInt(outputBase, currentAddress + 4, (int) (container >>> 32));
         }
         else {
-            UNSAFE.putLong(outputBase, currentAddress, container);
+            unsafe.putLong(outputBase, currentAddress, container);
         }
+        currentAddress += flushedBytes;
+        if (currentAddress > bosLimit) {
+            currentAddress = bosLimit;
+        }
+        bitCount &= 7;
+
+        if (currentAddress >= bosLimit) {
+            return 0;
+        }
+        return (int) ((currentAddress - outputAddress) + (bitCount > 0 ? 1 : 0));
+    }
+
+    // ARM/ART: 64-bit (no split longs) single-stream encoder, the way native zstd's
+    // HUF_compress1X_usingCTable fills its bit container: each symbol's code sits pre-shifted at
+    // the top of a long table entry with its bit count in the low byte, so adding a symbol is one
+    // read, one shift and one or (the container fills from the top; the entry's low byte only ever
+    // lands below the valid bits). Same bits, same order as compressSingleStream.
+    private static int compressSingleStream64(Object outputBase, long outputAddress, int outputSize, Object inputBase, long inputAddress, int inputSize, HuffmanCompressionTable table)
+    {
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
+        if (outputSize < SIZE_OF_LONG) {
+            return 0;
+        }
+
+        final long[] entries = table.fastEntries;
+        final long entriesBase = ARRAY_LONG_BASE_OFFSET;
+        final long bosLimit = outputAddress + outputSize - SIZE_OF_LONG;
+        // valid bits: the top bitCount bits of container, oldest lowest
+        long container = 0;
+        int bitCount = 0;
+        long currentAddress = outputAddress;
+        long input = inputAddress;
+
+        int n = inputSize & ~3; // join to mod 4
+        long entry;
+        int flushedBytes;
+
+        switch (inputSize & 3) {
+            case 3:
+                entry = unsafe.getLong(entries, entriesBase + ((long) (unsafe.getInt(inputBase, input + n) >>> 16 & 0xFF) << 3));
+                container = (container >>> entry) | entry;
+                bitCount += (int) entry;
+                // fall-through
+            case 2:
+                entry = unsafe.getLong(entries, entriesBase + ((long) (unsafe.getInt(inputBase, input + n) >>> 8 & 0xFF) << 3));
+                container = (container >>> entry) | entry;
+                bitCount += (int) entry;
+                // fall-through
+            case 1:
+                entry = unsafe.getLong(entries, entriesBase + ((long) (unsafe.getInt(inputBase, input + n) & 0xFF) << 3));
+                container = (container >>> entry) | entry;
+                bitCount += (int) entry;
+                // flush
+                flushedBytes = bitCount >>> 3;
+                unsafe.putLong(outputBase, currentAddress, container >>> (64 - bitCount));
+                currentAddress += flushedBytes;
+                if (currentAddress > bosLimit) {
+                    currentAddress = bosLimit;
+                }
+                bitCount &= 7;
+                // fall-through
+            case 0: /* fall-through */
+            default:
+                break;
+        }
+
+        for (; n > 0; n -= 4) {  // note: n & 3 == 0 at this stage
+            // one getInt for the 4 symbols (little endian: byte n-1 is the top byte)
+            int four = unsafe.getInt(inputBase, input + n - 4);
+            entry = unsafe.getLong(entries, entriesBase + ((long) (four >>> 24) << 3));
+            container = (container >>> entry) | entry;
+            bitCount += (int) entry;
+            entry = unsafe.getLong(entries, entriesBase + ((long) ((four >>> 16) & 0xFF) << 3));
+            container = (container >>> entry) | entry;
+            bitCount += (int) entry;
+            entry = unsafe.getLong(entries, entriesBase + ((long) ((four >>> 8) & 0xFF) << 3));
+            container = (container >>> entry) | entry;
+            bitCount += (int) entry;
+            entry = unsafe.getLong(entries, entriesBase + ((long) (four & 0xFF) << 3));
+            container = (container >>> entry) | entry;
+            bitCount += (int) entry;
+            // flush
+            flushedBytes = bitCount >>> 3;
+            unsafe.putLong(outputBase, currentAddress, container >>> (64 - bitCount));
+            currentAddress += flushedBytes;
+            if (currentAddress > bosLimit) {
+                currentAddress = bosLimit;
+            }
+            bitCount &= 7;
+        }
+
+        // BitOutputStream.close(): end mark + final flush
+        container = (container >>> 1) | (1L << 63);
+        bitCount += 1;
+        flushedBytes = bitCount >>> 3;
+        unsafe.putLong(outputBase, currentAddress, container >>> (64 - bitCount));
         currentAddress += flushedBytes;
         if (currentAddress > bosLimit) {
             currentAddress = bosLimit;

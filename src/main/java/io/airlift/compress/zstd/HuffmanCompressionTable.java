@@ -15,6 +15,8 @@ package io.airlift.compress.zstd;
 
 import java.util.Arrays;
 
+import sun.misc.Unsafe;
+
 import static io.airlift.compress.UnsafeUtil.UNSAFE;
 import static io.airlift.compress.zstd.Huffman.MAX_FSE_TABLE_LOG;
 import static io.airlift.compress.zstd.Huffman.MAX_SYMBOL;
@@ -32,6 +34,9 @@ final class HuffmanCompressionTable
     // ARM/ART: value | numberOfBits << 16 per symbol, so HuffmanCompressor does one array read (and
     // one bounds check) per literal instead of two. Written wherever values/numberOfBits change.
     final int[] entries;
+    // ARM/ART: code << (64 - numberOfBits) | numberOfBits per symbol (native zstd's HUF_CElt layout),
+    // for HuffmanCompressor.compressSingleStream64. Written with entries.
+    final long[] fastEntries;
 
     private int maxSymbol;
     private int maxNumberOfBits;
@@ -41,6 +46,7 @@ final class HuffmanCompressionTable
         this.values = new short[capacity];
         this.numberOfBits = new byte[capacity];
         this.entries = new int[capacity];
+        this.fastEntries = new long[capacity];
     }
 
     public static int optimalNumberOfBits(int maxNumberOfBits, int inputSize, int maxSymbol)
@@ -71,7 +77,7 @@ final class HuffmanCompressionTable
         NodeTable nodeTable = workspace.nodeTable;
         nodeTable.reset();
 
-        int lastNonZero = buildTree(counts, maxSymbol, nodeTable);
+        int lastNonZero = buildTree(counts, maxSymbol, nodeTable, workspace.sortKeys);
 
         // enforce max table log
         maxNumberOfBits = setMaxHeight(nodeTable, lastNonZero, maxNumberOfBits, workspace);
@@ -105,13 +111,14 @@ final class HuffmanCompressionTable
 
         for (int n = 0; n <= maxSymbol; n++) {
             entries[n] = (values[n] & 0xFFFF) | numberOfBits[n] << 16;
+            fastEntries[n] = numberOfBits[n] == 0 ? 0 : (long) (values[n] & 0xFFFF) << (64 - numberOfBits[n]) | numberOfBits[n];
         }
 
         this.maxSymbol = maxSymbol;
         this.maxNumberOfBits = maxNumberOfBits;
     }
 
-    private int buildTree(int[] counts, int maxSymbol, NodeTable nodeTable)
+    private int buildTree(int[] counts, int maxSymbol, NodeTable nodeTable, int[] sortKeys)
     {
         // populate the leaves of the node table from the histogram of counts
         // in descending order by count, ascending by symbol value.
@@ -123,7 +130,29 @@ final class HuffmanCompressionTable
 
         short current = 0;
 
-        for (int symbol = 0; symbol <= maxSymbol; symbol++) {
+        // The insertion sort below is O(n^2): up to ~32K moves for 256 literal symbols of similar
+        // counts, once per block (native zstd buckets them, HUF_sort). The order it produces - symbol
+        // 0 first (the loop never moves anything below position 1), then symbols 1..maxSymbol by
+        // descending count, ties by ascending symbol - is also the ascending order of the unique keys
+        // count << 8 | (255 - symbol) read backwards, so any sort of those keys gives the same
+        // leaves. Counts of a block's literals stay far below 1 << 23.
+        if (maxSymbol >= 1 && maxSymbol <= Huffman.MAX_SYMBOL && maxCount(counts, maxSymbol) < (1 << 23)) {
+            int keyCount = 0;
+            for (int symbol = 1; symbol <= maxSymbol; symbol++) {
+                sortKeys[keyCount++] = (counts[symbol] << 8) | (255 - symbol);
+            }
+            Arrays.sort(sortKeys, 0, keyCount);
+            nodeCounts[0] = counts[0];
+            nodeSymbols[0] = 0;
+            for (int position = 1; position <= keyCount; position++) {
+                int key = sortKeys[keyCount - position];
+                nodeCounts[position] = key >>> 8;
+                nodeSymbols[position] = 255 - (key & 0xFF);
+            }
+            current = (short) (maxSymbol + 1);
+        }
+
+        for (int symbol = current; symbol <= maxSymbol; symbol++) {
             int count = counts[symbol];
 
             // simple insertion sort
@@ -205,6 +234,15 @@ final class HuffmanCompressionTable
         return lastNonZero;
     }
 
+    private static int maxCount(int[] counts, int maxSymbol)
+    {
+        int max = 0;
+        for (int symbol = 0; symbol <= maxSymbol; symbol++) {
+            max = Math.max(max, counts[symbol]);
+        }
+        return max;
+    }
+
     // TODO: consider encoding 2 symbols at a time
     //   - need a table with 256x256 entries with
     //      - the concatenated bits for the corresponding pair of symbols
@@ -217,6 +255,10 @@ final class HuffmanCompressionTable
 
     public int write(Object outputBase, long outputAddress, int outputSize, HuffmanTableWriterWorkspace workspace)
     {
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
         byte[] weights = workspace.weights;
 
         long output = outputAddress;
@@ -251,7 +293,7 @@ final class HuffmanCompressionTable
             //   - the compressed size is better than what we'd get with the raw encoding below
             //   - the compressed size is <= 127 bytes, which is the most that the encoding can hold for FSE-compressed weights (see RFC 8478 section 4.2.1.1). This is implied
             //     by the maxSymbol / 2 check, since maxSymbol must be <= 255
-            UNSAFE.putByte(outputBase, output, (byte) size);
+            unsafe.putByte(outputBase, output, (byte) size);
             return size + 1; // header + size
         }
         else {
@@ -265,17 +307,23 @@ final class HuffmanCompressionTable
 
             // encode number of symbols
             // header = #entries + 127 per RFC
-            UNSAFE.putByte(outputBase, output, (byte) (127 + entryCount));
+            unsafe.putByte(outputBase, output, (byte) (127 + entryCount));
             output++;
 
             weights[maxSymbol] = 0; // last weight is implicit, so set to 0 so that it doesn't get encoded below
             for (int i = 0; i < entryCount; i += 2) {
-                UNSAFE.putByte(outputBase, output, (byte) ((weights[i] << 4) + weights[i + 1]));
+                unsafe.putByte(outputBase, output, (byte) ((weights[i] << 4) + weights[i + 1]));
                 output++;
             }
 
             return (int) (output - outputAddress);
         }
+    }
+
+    // isValid() is false for any histogram until the next initialize()
+    void invalidate()
+    {
+        maxSymbol = -1;
     }
 
     /**

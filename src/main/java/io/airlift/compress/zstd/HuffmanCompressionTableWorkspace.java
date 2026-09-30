@@ -25,6 +25,9 @@ class HuffmanCompressionTableWorkspace
     // for setMaxHeight
     public final int[] rankLast = new int[Huffman.MAX_TABLE_LOG + 2];
 
+    // for buildTree: the leaves' sort keys
+    public final int[] sortKeys = new int[Huffman.MAX_SYMBOL_COUNT];
+
     public void reset()
     {
         Arrays.fill(entriesPerRank, (short) 0);
