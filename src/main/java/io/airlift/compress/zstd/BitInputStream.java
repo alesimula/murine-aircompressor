@@ -13,6 +13,8 @@
  */
 package io.airlift.compress.zstd;
 
+import sun.misc.Unsafe;
+
 import static io.airlift.compress.UnsafeUtil.SPLIT_LONGS;
 import static io.airlift.compress.UnsafeUtil.UNSAFE;
 import static io.airlift.compress.zstd.Constants.SIZE_OF_LONG;
@@ -39,21 +41,25 @@ class BitInputStream
 
     static long readTail(Object inputBase, long inputAddress, int inputSize)
     {
-        long bits = UNSAFE.getByte(inputBase, inputAddress) & 0xFF;
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
+        long bits = unsafe.getByte(inputBase, inputAddress) & 0xFF;
 
         switch (inputSize) {
             case 7:
-                bits |= (UNSAFE.getByte(inputBase, inputAddress + 6) & 0xFFL) << 48;
+                bits |= (unsafe.getByte(inputBase, inputAddress + 6) & 0xFFL) << 48;
             case 6:
-                bits |= (UNSAFE.getByte(inputBase, inputAddress + 5) & 0xFFL) << 40;
+                bits |= (unsafe.getByte(inputBase, inputAddress + 5) & 0xFFL) << 40;
             case 5:
-                bits |= (UNSAFE.getByte(inputBase, inputAddress + 4) & 0xFFL) << 32;
+                bits |= (unsafe.getByte(inputBase, inputAddress + 4) & 0xFFL) << 32;
             case 4:
-                bits |= (UNSAFE.getByte(inputBase, inputAddress + 3) & 0xFFL) << 24;
+                bits |= (unsafe.getByte(inputBase, inputAddress + 3) & 0xFFL) << 24;
             case 3:
-                bits |= (UNSAFE.getByte(inputBase, inputAddress + 2) & 0xFFL) << 16;
+                bits |= (unsafe.getByte(inputBase, inputAddress + 2) & 0xFFL) << 16;
             case 2:
-                bits |= (UNSAFE.getByte(inputBase, inputAddress + 1) & 0xFFL) << 8;
+                bits |= (unsafe.getByte(inputBase, inputAddress + 1) & 0xFFL) << 8;
         }
 
         return bits;
@@ -89,10 +95,14 @@ class BitInputStream
 
     static int initializeBits(Object inputBase, long startAddress, long endAddress, long[] scratch)
     {
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
         final boolean split = SPLIT_LONGS;
         verify(endAddress - startAddress >= 1, startAddress, "Bitstream is empty");
 
-        int lastByte = UNSAFE.getByte(inputBase, endAddress - 1) & 0xFF;
+        int lastByte = unsafe.getByte(inputBase, endAddress - 1) & 0xFF;
         verify(lastByte != 0, endAddress, "Bitstream end mark not present");
 
         int bitsConsumed = SIZE_OF_LONG - highestBit(lastByte);
@@ -102,7 +112,7 @@ class BitInputStream
         int inputSize = (int) (endAddress - startAddress);
         if (inputSize >= SIZE_OF_LONG) {  /* normal case */
             currentAddress = endAddress - SIZE_OF_LONG;
-            bits = (split ? ((UNSAFE.getInt(inputBase, currentAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, currentAddress + 4) << 32)) : UNSAFE.getLong(inputBase, currentAddress));
+            bits = (split ? ((unsafe.getInt(inputBase, currentAddress) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, currentAddress + 4) << 32)) : unsafe.getLong(inputBase, currentAddress));
         }
         else {
             currentAddress = startAddress;
@@ -118,6 +128,10 @@ class BitInputStream
 
     static int loadBits(Object inputBase, long startAddress, long currentAddress, long bits, int bitsConsumed, long[] scratch)
     {
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
         final boolean split = SPLIT_LONGS;
         // identical logic to Loader.load()
         if (bitsConsumed > 64) {
@@ -135,7 +149,7 @@ class BitInputStream
         if (currentAddress >= startAddress + SIZE_OF_LONG) {
             if (bytes > 0) {
                 currentAddress -= bytes;
-                bits = (split ? ((UNSAFE.getInt(inputBase, currentAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, currentAddress + 4) << 32)) : UNSAFE.getLong(inputBase, currentAddress));
+                bits = (split ? ((unsafe.getInt(inputBase, currentAddress) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, currentAddress + 4) << 32)) : unsafe.getLong(inputBase, currentAddress));
             }
             bitsConsumed &= 0b111;
         }
@@ -143,7 +157,7 @@ class BitInputStream
             bytes = (int) (currentAddress - startAddress);
             currentAddress = startAddress;
             bitsConsumed -= bytes * SIZE_OF_LONG;
-            bits = (split ? ((UNSAFE.getInt(inputBase, startAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, startAddress + 4) << 32)) : UNSAFE.getLong(inputBase, startAddress));
+            bits = (split ? ((unsafe.getInt(inputBase, startAddress) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, startAddress + 4) << 32)) : unsafe.getLong(inputBase, startAddress));
             scratch[0] = bits;
             scratch[1] = currentAddress;
             return bitsConsumed | LOAD_DONE;
@@ -151,7 +165,7 @@ class BitInputStream
         else {
             currentAddress -= bytes;
             bitsConsumed -= bytes * SIZE_OF_LONG;
-            bits = (split ? ((UNSAFE.getInt(inputBase, currentAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, currentAddress + 4) << 32)) : UNSAFE.getLong(inputBase, currentAddress));
+            bits = (split ? ((unsafe.getInt(inputBase, currentAddress) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, currentAddress + 4) << 32)) : unsafe.getLong(inputBase, currentAddress));
         }
 
         scratch[0] = bits;
