@@ -13,6 +13,8 @@
  */
 package io.airlift.compress.zstd;
 
+import sun.misc.Unsafe;
+
 import static io.airlift.compress.UnsafeUtil.ARRAY_BYTE_BASE_OFFSET;
 import static io.airlift.compress.UnsafeUtil.SPLIT_LONGS;
 import static io.airlift.compress.UnsafeUtil.UNSAFE;
@@ -25,6 +27,8 @@ import static io.airlift.compress.zstd.Constants.SIZE_OF_LONG;
 class DoubleFastBlockCompressor
         implements BlockCompressor
 {
+    private static final long ARRAY_INT_BASE_OFFSET = UNSAFE.arrayBaseOffset(int[].class);
+
     private static final int MIN_MATCH = 3;
     private static final int SEARCH_STRENGTH = 8;
     private static final int REP_MOVE = Constants.REPEATED_OFFSET_COUNT - 1;
@@ -41,7 +45,14 @@ class DoubleFastBlockCompressor
 
     public int compressBlock(Object inputBase, final long inputAddress, int inputSize, SequenceStore output, BlockCompressionState state, RepeatedOffsets offsets, CompressionParameters parameters)
     {
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
         final boolean split = SPLIT_LONGS;
+        if (!split) {
+            return compressBlock64(inputBase, inputAddress, inputSize, output, state, offsets, parameters);
+        }
         int matchSearchLength = Math.max(parameters.getSearchLength(), 4);
 
         // Offsets in hash tables are relative to baseAddress. Hash tables can be reused across calls to compressBlock as long as
@@ -120,7 +131,7 @@ class DoubleFastBlockCompressor
             // single read of the 8 bytes at `input`, reused for the long hash, the long-match
             // compare and the repcode compare ((int) (currentLong >>> 8) == getInt at input + 1
             // on this little-endian-only library)
-            long currentLong = (split ? ((UNSAFE.getInt(inputBase, input) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, input + 4) << 32)) : UNSAFE.getLong(inputBase, input));
+            long currentLong = (split ? ((unsafe.getInt(inputBase, input) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, input + 4) << 32)) : unsafe.getLong(inputBase, input));
 
             int shortHash = intShortHash
                     ? ((int) currentLong * PRIME_4_BYTES) >>> intHashRightShift
@@ -136,13 +147,13 @@ class DoubleFastBlockCompressor
             shortHashTable[shortHash] = current;
 
             int matchKind;
-            if (offset1 > 0 && UNSAFE.getInt(inputBase, input + 1 - offset1) == (int) (currentLong >>> 8)) {
+            if (offset1 > 0 && unsafe.getInt(inputBase, input + 1 - offset1) == (int) (currentLong >>> 8)) {
                 matchKind = MATCH_KIND_REPCODE;
             }
-            else if (longMatchAddress > windowBaseAddress && (split ? ((UNSAFE.getInt(inputBase, longMatchAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, longMatchAddress + 4) << 32)) : UNSAFE.getLong(inputBase, longMatchAddress)) == currentLong) {
+            else if (longMatchAddress > windowBaseAddress && (split ? ((unsafe.getInt(inputBase, longMatchAddress) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, longMatchAddress + 4) << 32)) : unsafe.getLong(inputBase, longMatchAddress)) == currentLong) {
                 matchKind = MATCH_KIND_LONG;
             }
-            else if (shortMatchAddress > windowBaseAddress && UNSAFE.getInt(inputBase, shortMatchAddress) == (int) currentLong) {
+            else if (shortMatchAddress > windowBaseAddress && unsafe.getInt(inputBase, shortMatchAddress) == (int) currentLong) {
                 matchKind = MATCH_KIND_SHORT;
             }
             else {
@@ -170,6 +181,356 @@ class DoubleFastBlockCompressor
         return (int) (inputEnd - anchor);
     }
 
+    // ARM/ART: 64-bit (no split longs) DFAST path, shaped like FastBlockCompressor.compressBlock64
+    // (see there): the positions without a match are scanned by scan(), a small method of its own,
+    // and everything done per match is written out here. Same algorithm and output as the generic
+    // loop above.
+    private static int compressBlock64(Object inputBase, final long inputAddress, int inputSize, SequenceStore output, BlockCompressionState state, RepeatedOffsets offsets, CompressionParameters parameters)
+    {
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
+        int matchSearchLength = Math.max(parameters.getSearchLength(), 4);
+
+
+        final long baseAddress = state.getBaseAddress();
+        final long windowBaseAddress = baseAddress + state.getWindowBaseOffset();
+        final long inputEnd = inputAddress + inputSize;
+        final long inputLimit = inputEnd - SIZE_OF_LONG; // We read a long at a time for computing the hashes
+
+        long input = inputAddress;
+        long anchor = inputAddress;
+
+        int offset1 = offsets.getOffset0();
+        int offset2 = offsets.getOffset1();
+
+        int savedOffset = 0;
+
+        if (input - windowBaseAddress == 0) {
+            input++;
+        }
+        int maxRep = (int) (input - windowBaseAddress);
+
+        if (offset2 > maxRep) {
+            savedOffset = offset2;
+            offset2 = 0;
+        }
+
+        if (offset1 > maxRep) {
+            savedOffset = offset1;
+            offset1 = 0;
+        }
+
+        // short hash: the 4-byte hash is the long hash of the value shifted left by 32 (the top 32
+        // bits of (v << 32) * P are those of (int) v * (int) P), and (v << L) * P is v * (P << L)
+        final long shortHashPrime;
+        final int shortHashLeftShift;
+        switch (matchSearchLength) {
+            case 4:
+                shortHashPrime = PRIME_4_BYTES & 0xFFFFFFFFL;
+                shortHashLeftShift = Long.SIZE - 32;
+                break;
+            case 5:
+                shortHashPrime = PRIME_5_BYTES;
+                shortHashLeftShift = Long.SIZE - 40;
+                break;
+            case 6:
+                shortHashPrime = PRIME_6_BYTES;
+                shortHashLeftShift = Long.SIZE - 48;
+                break;
+            case 7:
+                shortHashPrime = PRIME_7_BYTES;
+                shortHashLeftShift = Long.SIZE - 56;
+                break;
+            default:
+                shortHashPrime = PRIME_8_BYTES;
+                shortHashLeftShift = 0;
+                break;
+        }
+
+        final long shortHashMultiplier = shortHashPrime << shortHashLeftShift;
+        final int shortHashRightShift = Long.SIZE - parameters.getChainLog();
+        final int longHashRightShift = Long.SIZE - parameters.getHashLog();
+        final int[] longHashTable = state.hashTable;
+        final int[] shortHashTable = state.chainTable;
+        final long hashTableBase = ARRAY_INT_BASE_OFFSET;
+        final long literalsBufferBase = ARRAY_BYTE_BASE_OFFSET;
+        final int[] seqLiteralLengths = output.literalLengths;
+        final int[] seqOffsets = output.offsets;
+        final int[] seqMatchLengths = output.matchLengths;
+        final byte[] literalsBuffer = output.literalsBuffer;
+        int sequenceCount = output.sequenceCount;
+
+        while (true) {
+            // positions without a match: scan, a small loop in a method of its own
+            long found = scan(unsafe, inputBase, input, anchor, inputLimit, longHashTable, shortHashTable, hashTableBase, baseAddress, windowBaseAddress, offset1,
+                    shortHashMultiplier, shortHashRightShift, longHashRightShift);
+            if (found < 0) {
+                break;
+            }
+            input = windowBaseAddress + (found >>> 32);
+            int matchKind = (int) found & 0b11;
+            int matchOffset = (int) found >>> 2;
+            long longMatchAddress = input - matchOffset;
+            long shortMatchAddress = input - matchOffset;
+            int current = (int) (input - baseAddress);
+
+            long matchAddress;
+            int prefixLength;
+            if (matchKind == MATCH_KIND_REPCODE) {
+                // found a repeated sequence of at least 4 bytes, separated by offset1
+                input++;
+                matchAddress = input - offset1;
+                prefixLength = SIZE_OF_INT;
+            }
+            else if (matchKind == MATCH_KIND_LONG) {
+                // prefix long match
+                matchAddress = longMatchAddress;
+                prefixLength = SIZE_OF_LONG;
+            }
+            else {
+                // prefix short match
+                long nextLong = unsafe.getLong(inputBase, input + 1);
+                int nextOffsetHash = (int) ((nextLong * PRIME_8_BYTES) >>> longHashRightShift);
+                long nextOffsetMatchAddress = baseAddress + longHashTable[nextOffsetHash];
+                longHashTable[nextOffsetHash] = current + 1;
+
+                // check prefix long +1 match
+                if (nextOffsetMatchAddress > windowBaseAddress && unsafe.getLong(inputBase, nextOffsetMatchAddress) == nextLong) {
+                    input++;
+                    matchAddress = nextOffsetMatchAddress;
+                    prefixLength = SIZE_OF_LONG;
+                }
+                else {
+                    // if no long +1 match, explore the short match we found
+                    matchAddress = shortMatchAddress;
+                    prefixLength = SIZE_OF_INT;
+                }
+            }
+
+            // ---- begin inlined count ----
+            long countInput = input + prefixLength;
+            long countMatch = matchAddress + prefixLength;
+            int remaining = (int) (inputEnd - countInput);
+            int matchLength = 0;
+            countLoop:
+            {
+                while (matchLength < remaining - (SIZE_OF_LONG - 1)) {
+                    long diff = unsafe.getLong(inputBase, countMatch) ^ unsafe.getLong(inputBase, countInput);
+                    if (diff != 0) {
+                        matchLength += Long.numberOfTrailingZeros(diff) >> 3;
+                        break countLoop;
+                    }
+                    matchLength += SIZE_OF_LONG;
+                    countInput += SIZE_OF_LONG;
+                    countMatch += SIZE_OF_LONG;
+                }
+                while (matchLength < remaining && unsafe.getByte(inputBase, countMatch) == unsafe.getByte(inputBase, countInput)) {
+                    matchLength++;
+                    countInput++;
+                    countMatch++;
+                }
+            }
+            // ---- end inlined count ----
+            matchLength += prefixLength;
+
+            int offsetCode;
+            if (matchKind == MATCH_KIND_REPCODE) {
+                offsetCode = 0;
+            }
+            else {
+                int offset = (int) (input - matchAddress);
+                // ---- begin inlined extendBackward (backward match extension, "catch up") ----
+                catchUp:
+                {
+                    while (input - SIZE_OF_LONG >= anchor && matchAddress - SIZE_OF_LONG >= windowBaseAddress) {
+                        long diff = unsafe.getLong(inputBase, input - SIZE_OF_LONG) ^ unsafe.getLong(inputBase, matchAddress - SIZE_OF_LONG);
+                        if (diff != 0) {
+                            int equalBytes = Long.numberOfLeadingZeros(diff) >>> 3;
+                            input -= equalBytes;
+                            matchLength += equalBytes;
+                            break catchUp;
+                        }
+                        input -= SIZE_OF_LONG;
+                        matchAddress -= SIZE_OF_LONG;
+                        matchLength += SIZE_OF_LONG;
+                    }
+                    // fewer than 8 bytes left before the anchor or the window start: compare the 8 bytes
+                    // before both anyway and keep the equal ones that are available. Both reads stay in the
+                    // buffer when the match is 8 bytes past the window start (input is after the match).
+                    long available = Math.min(input - anchor, matchAddress - windowBaseAddress);
+                    if (available > 0) {
+                        if (matchAddress - SIZE_OF_LONG >= windowBaseAddress) {
+                            long diff = unsafe.getLong(inputBase, input - SIZE_OF_LONG) ^ unsafe.getLong(inputBase, matchAddress - SIZE_OF_LONG);
+                            int equalBytes = Long.numberOfLeadingZeros(diff) >>> 3;
+                            if (equalBytes > available) {
+                                equalBytes = (int) available;
+                            }
+                            input -= equalBytes;
+                            matchLength += equalBytes;
+                        }
+                        else {
+                            while (input > anchor && matchAddress > windowBaseAddress && unsafe.getByte(inputBase, input - 1) == unsafe.getByte(inputBase, matchAddress - 1)) {
+                                input--;
+                                matchAddress--;
+                                matchLength++;
+                            }
+                        }
+                    }
+                }
+                // ---- end inlined extendBackward ----
+                offset2 = offset1;
+                offset1 = offset;
+                offsetCode = offset + REP_MOVE;
+            }
+
+            {
+                // ---- begin inlined SequenceStore.storeSequence (same stores, same order) ----
+                int literalsLength = output.literalsLength;
+                int literalLength = (int) (input - anchor);
+                long copySource = anchor;
+                long copyTarget = literalsBufferBase + literalsLength;
+                int copied = 0;
+                do {
+                    unsafe.putLong(literalsBuffer, copyTarget, unsafe.getLong(inputBase, copySource));
+                    copySource += SIZE_OF_LONG;
+                    copyTarget += SIZE_OF_LONG;
+                    copied += SIZE_OF_LONG;
+                }
+                while (copied < literalLength);
+                output.literalsLength = literalsLength + literalLength;
+                if (literalLength > 65535) {
+                    output.longLengthField = SequenceStore.LongField.LITERAL;
+                    output.longLengthPosition = sequenceCount;
+                }
+                seqLiteralLengths[sequenceCount] = literalLength;
+                seqOffsets[sequenceCount] = offsetCode + 1;
+                int matchLengthBase = matchLength - MIN_MATCH;
+                if (matchLengthBase > 65535) {
+                    output.longLengthField = SequenceStore.LongField.MATCH;
+                    output.longLengthPosition = sequenceCount;
+                }
+                seqMatchLengths[sequenceCount] = matchLengthBase;
+                sequenceCount++;
+                // ---- end inlined SequenceStore.storeSequence ----
+            }
+
+            input += matchLength;
+
+            if (input <= inputLimit) {
+                // Fill Table
+                long fillValue = unsafe.getLong(inputBase, baseAddress + current + 2);
+                longHashTable[(int) ((fillValue * PRIME_8_BYTES) >>> longHashRightShift)] = current + 2;
+                shortHashTable[(int) ((fillValue * shortHashMultiplier) >>> shortHashRightShift)] = current + 2;
+
+                fillValue = unsafe.getLong(inputBase, input - 2);
+                longHashTable[(int) ((fillValue * PRIME_8_BYTES) >>> longHashRightShift)] = (int) (input - 2 - baseAddress);
+                shortHashTable[(int) ((fillValue * shortHashMultiplier) >>> shortHashRightShift)] = (int) (input - 2 - baseAddress);
+
+                while (input <= inputLimit && offset2 > 0 && unsafe.getInt(inputBase, input) == unsafe.getInt(inputBase, input - offset2)) {
+                    // ---- begin inlined count ----
+                    countInput = input + SIZE_OF_INT;
+                    countMatch = countInput - offset2;
+                    remaining = (int) (inputEnd - countInput);
+                    int count = 0;
+                    repeatCountLoop:
+                    {
+                        while (count < remaining - (SIZE_OF_LONG - 1)) {
+                            long diff = unsafe.getLong(inputBase, countMatch) ^ unsafe.getLong(inputBase, countInput);
+                            if (diff != 0) {
+                                count += Long.numberOfTrailingZeros(diff) >> 3;
+                                break repeatCountLoop;
+                            }
+                            count += SIZE_OF_LONG;
+                            countInput += SIZE_OF_LONG;
+                            countMatch += SIZE_OF_LONG;
+                        }
+                        while (count < remaining && unsafe.getByte(inputBase, countMatch) == unsafe.getByte(inputBase, countInput)) {
+                            count++;
+                            countInput++;
+                            countMatch++;
+                        }
+                    }
+                    // ---- end inlined count ----
+                    int repetitionLength = count + SIZE_OF_INT;
+
+                    // swap offset2 <=> offset1
+                    int temp = offset2;
+                    offset2 = offset1;
+                    offset1 = temp;
+
+                    long repeatValue = unsafe.getLong(inputBase, input);
+                    shortHashTable[(int) ((repeatValue * shortHashMultiplier) >>> shortHashRightShift)] = (int) (input - baseAddress);
+                    longHashTable[(int) ((repeatValue * PRIME_8_BYTES) >>> longHashRightShift)] = (int) (input - baseAddress);
+
+                    {
+                        // inlined SequenceStore.storeSequence with no literals: nothing to copy, and a
+                        // literal length of 0 can't hit the long-length case
+                        seqLiteralLengths[sequenceCount] = 0;
+                        seqOffsets[sequenceCount] = 0 + 1;
+                        int matchLengthBase = repetitionLength - MIN_MATCH;
+                        if (matchLengthBase > 65535) {
+                            output.longLengthField = SequenceStore.LongField.MATCH;
+                            output.longLengthPosition = sequenceCount;
+                        }
+                        seqMatchLengths[sequenceCount] = matchLengthBase;
+                        sequenceCount++;
+                    }
+
+                    input += repetitionLength;
+                }
+            }
+            anchor = input;
+        }
+
+        output.sequenceCount = sequenceCount;
+
+        // save reps for next block
+        offsets.saveOffset0(offset1 != 0 ? offset1 : savedOffset);
+        offsets.saveOffset1(offset2 != 0 ? offset2 : savedOffset);
+
+        // return the last literals size
+        return (int) (inputEnd - anchor);
+    }
+
+    // The per-position loop: from input, the first position with a match, as
+    // (position - windowBaseAddress) << 32 | (position - match address) << 2 | match kind (the
+    // distance is 0 for a repcode match; both table entries of that position are written), or -1
+    // at inputLimit. Alone in a method, with no call inside, so its values stay in registers.
+    private static long scan(final Unsafe unsafe, Object inputBase, long input, long anchor, long inputLimit, int[] longHashTable, int[] shortHashTable, long hashTableBase,
+            long baseAddress, long windowBaseAddress, int offset1, long shortHashMultiplier, int shortHashRightShift, int longHashRightShift)
+    {
+        while (input < inputLimit) {   // < instead of <=, because repcode check at (input+1)
+            long currentLong = unsafe.getLong(inputBase, input);
+
+            // ARM/ART: the tables through Unsafe: the hashes are always in range (shifted down to the
+            // tables' logs), and ART would bounds-check the four accesses at every position
+            long shortHashAddress = hashTableBase + (((currentLong * shortHashMultiplier) >>> shortHashRightShift) << 2);
+            long shortMatchAddress = baseAddress + unsafe.getInt(shortHashTable, shortHashAddress);
+
+            long longHashAddress = hashTableBase + (((currentLong * PRIME_8_BYTES) >>> longHashRightShift) << 2);
+            long longMatchAddress = baseAddress + unsafe.getInt(longHashTable, longHashAddress);
+
+            // update hash tables
+            int position = (int) (input - baseAddress);
+            unsafe.putInt(longHashTable, longHashAddress, position);
+            unsafe.putInt(shortHashTable, shortHashAddress, position);
+
+            if (offset1 > 0 && unsafe.getInt(inputBase, input + 1 - offset1) == (int) (currentLong >>> 8)) {
+                return (input - windowBaseAddress) << 32 | MATCH_KIND_REPCODE;
+            }
+            if (longMatchAddress > windowBaseAddress && unsafe.getLong(inputBase, longMatchAddress) == currentLong) {
+                return (input - windowBaseAddress) << 32 | (input - longMatchAddress) << 2 | MATCH_KIND_LONG;
+            }
+            if (shortMatchAddress > windowBaseAddress && unsafe.getInt(inputBase, shortMatchAddress) == (int) currentLong) {
+                return (input - windowBaseAddress) << 32 | (input - shortMatchAddress) << 2 | MATCH_KIND_SHORT;
+            }
+            input += ((input - anchor) >> SEARCH_STRENGTH) + 1;
+        }
+        return -1;
+    }
+
     // Runs once per discovered sequence: match extension, sequence store, table refill and the
     // repcode repeat loop - verbatim the bodies of the original in-loop branches. Returns the
     // updated scan state through `cursor`.
@@ -179,6 +540,10 @@ class DoubleFastBlockCompressor
             int[] longHashTable, int longHashBits, int[] shortHashTable, int shortHashBits, int matchSearchLength,
             SequenceStore output, long[] cursor)
     {
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
         final boolean split = SPLIT_LONGS;
         // long hash (hash8) inlined as ((value * PRIME_8_BYTES) >>> longHashRightShift)
         final int longHashRightShift = Long.SIZE - longHashBits;
@@ -208,12 +573,12 @@ class DoubleFastBlockCompressor
                 int copied = 0;
                 do {
                     if (split) {
-                        long splitValue = ((UNSAFE.getInt(inputBase, copySource) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, copySource + 4) << 32));
-                        UNSAFE.putInt(literalsBuffer, copyTarget, (int) splitValue);
-                        UNSAFE.putInt(literalsBuffer, copyTarget + 4, (int) (splitValue >>> 32));
+                        long splitValue = ((unsafe.getInt(inputBase, copySource) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, copySource + 4) << 32));
+                        unsafe.putInt(literalsBuffer, copyTarget, (int) splitValue);
+                        unsafe.putInt(literalsBuffer, copyTarget + 4, (int) (splitValue >>> 32));
                     }
                     else {
-                        UNSAFE.putLong(literalsBuffer, copyTarget, UNSAFE.getLong(inputBase, copySource));
+                        unsafe.putLong(literalsBuffer, copyTarget, unsafe.getLong(inputBase, copySource));
                     }
                     copySource += SIZE_OF_LONG;
                     copyTarget += SIZE_OF_LONG;
@@ -248,7 +613,7 @@ class DoubleFastBlockCompressor
                 catchUp:
                 {
                     while (input - SIZE_OF_LONG >= anchor && longMatchAddress - SIZE_OF_LONG >= windowBaseAddress) {
-                        long diff = (split ? ((UNSAFE.getInt(inputBase, (input - SIZE_OF_LONG)) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, (input - SIZE_OF_LONG) + 4) << 32)) : UNSAFE.getLong(inputBase, (input - SIZE_OF_LONG))) ^ (split ? ((UNSAFE.getInt(inputBase, (longMatchAddress - SIZE_OF_LONG)) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, (longMatchAddress - SIZE_OF_LONG) + 4) << 32)) : UNSAFE.getLong(inputBase, (longMatchAddress - SIZE_OF_LONG)));
+                        long diff = (split ? ((unsafe.getInt(inputBase, (input - SIZE_OF_LONG)) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, (input - SIZE_OF_LONG) + 4) << 32)) : unsafe.getLong(inputBase, (input - SIZE_OF_LONG))) ^ (split ? ((unsafe.getInt(inputBase, (longMatchAddress - SIZE_OF_LONG)) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, (longMatchAddress - SIZE_OF_LONG) + 4) << 32)) : unsafe.getLong(inputBase, (longMatchAddress - SIZE_OF_LONG)));
                         if (diff != 0) {
                             int equalBytes = Long.numberOfLeadingZeros(diff) >>> 3;
                             input -= equalBytes;
@@ -259,7 +624,7 @@ class DoubleFastBlockCompressor
                         longMatchAddress -= SIZE_OF_LONG;
                         matchLength += SIZE_OF_LONG;
                     }
-                    while (input > anchor && longMatchAddress > windowBaseAddress && UNSAFE.getByte(inputBase, input - 1) == UNSAFE.getByte(inputBase, longMatchAddress - 1)) {
+                    while (input > anchor && longMatchAddress > windowBaseAddress && unsafe.getByte(inputBase, input - 1) == unsafe.getByte(inputBase, longMatchAddress - 1)) {
                         input--;
                         longMatchAddress--;
                         matchLength++;
@@ -269,13 +634,13 @@ class DoubleFastBlockCompressor
             }
             else {
                 // prefix short match
-                long nextLong = (split ? ((UNSAFE.getInt(inputBase, (input + 1)) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, (input + 1) + 4) << 32)) : UNSAFE.getLong(inputBase, input + 1));
+                long nextLong = (split ? ((unsafe.getInt(inputBase, (input + 1)) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, (input + 1) + 4) << 32)) : unsafe.getLong(inputBase, input + 1));
                 int nextOffsetHash = (int) ((nextLong * PRIME_8_BYTES) >>> longHashRightShift);
                 long nextOffsetMatchAddress = baseAddress + longHashTable[nextOffsetHash];
                 longHashTable[nextOffsetHash] = current + 1;
 
                 // check prefix long +1 match
-                if (nextOffsetMatchAddress > windowBaseAddress && (split ? ((UNSAFE.getInt(inputBase, nextOffsetMatchAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, nextOffsetMatchAddress + 4) << 32)) : UNSAFE.getLong(inputBase, nextOffsetMatchAddress)) == nextLong) {
+                if (nextOffsetMatchAddress > windowBaseAddress && (split ? ((unsafe.getInt(inputBase, nextOffsetMatchAddress) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, nextOffsetMatchAddress + 4) << 32)) : unsafe.getLong(inputBase, nextOffsetMatchAddress)) == nextLong) {
                     matchLength = count(inputBase, input + 1 + SIZE_OF_LONG, inputEnd, nextOffsetMatchAddress + SIZE_OF_LONG) + SIZE_OF_LONG;
                     input++;
                     offset = (int) (input - nextOffsetMatchAddress);
@@ -286,7 +651,7 @@ class DoubleFastBlockCompressor
                     catchUp:
                     {
                         while (input - SIZE_OF_LONG >= anchor && nextOffsetMatchAddress - SIZE_OF_LONG >= windowBaseAddress) {
-                            long diff = (split ? ((UNSAFE.getInt(inputBase, (input - SIZE_OF_LONG)) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, (input - SIZE_OF_LONG) + 4) << 32)) : UNSAFE.getLong(inputBase, (input - SIZE_OF_LONG))) ^ (split ? ((UNSAFE.getInt(inputBase, (nextOffsetMatchAddress - SIZE_OF_LONG)) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, (nextOffsetMatchAddress - SIZE_OF_LONG) + 4) << 32)) : UNSAFE.getLong(inputBase, (nextOffsetMatchAddress - SIZE_OF_LONG)));
+                            long diff = (split ? ((unsafe.getInt(inputBase, (input - SIZE_OF_LONG)) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, (input - SIZE_OF_LONG) + 4) << 32)) : unsafe.getLong(inputBase, (input - SIZE_OF_LONG))) ^ (split ? ((unsafe.getInt(inputBase, (nextOffsetMatchAddress - SIZE_OF_LONG)) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, (nextOffsetMatchAddress - SIZE_OF_LONG) + 4) << 32)) : unsafe.getLong(inputBase, (nextOffsetMatchAddress - SIZE_OF_LONG)));
                             if (diff != 0) {
                                 int equalBytes = Long.numberOfLeadingZeros(diff) >>> 3;
                                 input -= equalBytes;
@@ -297,7 +662,7 @@ class DoubleFastBlockCompressor
                             nextOffsetMatchAddress -= SIZE_OF_LONG;
                             matchLength += SIZE_OF_LONG;
                         }
-                        while (input > anchor && nextOffsetMatchAddress > windowBaseAddress && UNSAFE.getByte(inputBase, input - 1) == UNSAFE.getByte(inputBase, nextOffsetMatchAddress - 1)) {
+                        while (input > anchor && nextOffsetMatchAddress > windowBaseAddress && unsafe.getByte(inputBase, input - 1) == unsafe.getByte(inputBase, nextOffsetMatchAddress - 1)) {
                             input--;
                             nextOffsetMatchAddress--;
                             matchLength++;
@@ -316,7 +681,7 @@ class DoubleFastBlockCompressor
                     catchUp:
                     {
                         while (input - SIZE_OF_LONG >= anchor && shortMatchAddress - SIZE_OF_LONG >= windowBaseAddress) {
-                            long diff = (split ? ((UNSAFE.getInt(inputBase, (input - SIZE_OF_LONG)) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, (input - SIZE_OF_LONG) + 4) << 32)) : UNSAFE.getLong(inputBase, (input - SIZE_OF_LONG))) ^ (split ? ((UNSAFE.getInt(inputBase, (shortMatchAddress - SIZE_OF_LONG)) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, (shortMatchAddress - SIZE_OF_LONG) + 4) << 32)) : UNSAFE.getLong(inputBase, (shortMatchAddress - SIZE_OF_LONG)));
+                            long diff = (split ? ((unsafe.getInt(inputBase, (input - SIZE_OF_LONG)) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, (input - SIZE_OF_LONG) + 4) << 32)) : unsafe.getLong(inputBase, (input - SIZE_OF_LONG))) ^ (split ? ((unsafe.getInt(inputBase, (shortMatchAddress - SIZE_OF_LONG)) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, (shortMatchAddress - SIZE_OF_LONG) + 4) << 32)) : unsafe.getLong(inputBase, (shortMatchAddress - SIZE_OF_LONG)));
                             if (diff != 0) {
                                 int equalBytes = Long.numberOfLeadingZeros(diff) >>> 3;
                                 input -= equalBytes;
@@ -327,7 +692,7 @@ class DoubleFastBlockCompressor
                             shortMatchAddress -= SIZE_OF_LONG;
                             matchLength += SIZE_OF_LONG;
                         }
-                        while (input > anchor && shortMatchAddress > windowBaseAddress && UNSAFE.getByte(inputBase, input - 1) == UNSAFE.getByte(inputBase, shortMatchAddress - 1)) {
+                        while (input > anchor && shortMatchAddress > windowBaseAddress && unsafe.getByte(inputBase, input - 1) == unsafe.getByte(inputBase, shortMatchAddress - 1)) {
                             input--;
                             shortMatchAddress--;
                             matchLength++;
@@ -348,12 +713,12 @@ class DoubleFastBlockCompressor
                 int copied = 0;
                 do {
                     if (split) {
-                        long splitValue = ((UNSAFE.getInt(inputBase, copySource) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, copySource + 4) << 32));
-                        UNSAFE.putInt(literalsBuffer, copyTarget, (int) splitValue);
-                        UNSAFE.putInt(literalsBuffer, copyTarget + 4, (int) (splitValue >>> 32));
+                        long splitValue = ((unsafe.getInt(inputBase, copySource) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, copySource + 4) << 32));
+                        unsafe.putInt(literalsBuffer, copyTarget, (int) splitValue);
+                        unsafe.putInt(literalsBuffer, copyTarget + 4, (int) (splitValue >>> 32));
                     }
                     else {
-                        UNSAFE.putLong(literalsBuffer, copyTarget, UNSAFE.getLong(inputBase, copySource));
+                        unsafe.putLong(literalsBuffer, copyTarget, unsafe.getLong(inputBase, copySource));
                     }
                     copySource += SIZE_OF_LONG;
                     copyTarget += SIZE_OF_LONG;
@@ -418,15 +783,15 @@ class DoubleFastBlockCompressor
             final int intHashRightShift = Integer.SIZE - shortHashBits;
 
             // Fill Table
-            long fillValue = (split ? ((UNSAFE.getInt(inputBase, (baseAddress + current + 2)) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, (baseAddress + current + 2) + 4) << 32)) : UNSAFE.getLong(inputBase, baseAddress + current + 2));
+            long fillValue = (split ? ((unsafe.getInt(inputBase, (baseAddress + current + 2)) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, (baseAddress + current + 2) + 4) << 32)) : unsafe.getLong(inputBase, baseAddress + current + 2));
             longHashTable[(int) ((fillValue * PRIME_8_BYTES) >>> longHashRightShift)] = current + 2;
             shortHashTable[(intShortHash ? ((int) fillValue * PRIME_4_BYTES) >>> intHashRightShift : (int) (((fillValue << shortHashLeftShift) * shortHashPrime) >>> shortHashRightShift))] = current + 2;
 
-            fillValue = (split ? ((UNSAFE.getInt(inputBase, (input - 2)) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, (input - 2) + 4) << 32)) : UNSAFE.getLong(inputBase, input - 2));
+            fillValue = (split ? ((unsafe.getInt(inputBase, (input - 2)) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, (input - 2) + 4) << 32)) : unsafe.getLong(inputBase, input - 2));
             longHashTable[(int) ((fillValue * PRIME_8_BYTES) >>> longHashRightShift)] = (int) (input - 2 - baseAddress);
             shortHashTable[(intShortHash ? ((int) fillValue * PRIME_4_BYTES) >>> intHashRightShift : (int) (((fillValue << shortHashLeftShift) * shortHashPrime) >>> shortHashRightShift))] = (int) (input - 2 - baseAddress);
 
-            while (input <= inputLimit && offset2 > 0 && UNSAFE.getInt(inputBase, input) == UNSAFE.getInt(inputBase, input - offset2)) {
+            while (input <= inputLimit && offset2 > 0 && unsafe.getInt(inputBase, input) == unsafe.getInt(inputBase, input - offset2)) {
                 int repetitionLength = count(inputBase, input + SIZE_OF_INT, inputEnd, input + SIZE_OF_INT - offset2) + SIZE_OF_INT;
 
                 // swap offset2 <=> offset1
@@ -434,7 +799,7 @@ class DoubleFastBlockCompressor
                 offset2 = offset1;
                 offset1 = temp;
 
-                long repeatValue = (split ? ((UNSAFE.getInt(inputBase, input) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, input + 4) << 32)) : UNSAFE.getLong(inputBase, input));
+                long repeatValue = (split ? ((unsafe.getInt(inputBase, input) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, input + 4) << 32)) : unsafe.getLong(inputBase, input));
                 shortHashTable[(intShortHash ? ((int) repeatValue * PRIME_4_BYTES) >>> intHashRightShift : (int) (((repeatValue << shortHashLeftShift) * shortHashPrime) >>> shortHashRightShift))] = (int) (input - baseAddress);
                 longHashTable[(int) ((repeatValue * PRIME_8_BYTES) >>> longHashRightShift)] = (int) (input - baseAddress);
 
@@ -473,6 +838,10 @@ class DoubleFastBlockCompressor
      */
     public static int count(Object inputBase, final long inputAddress, final long inputLimit, final long matchAddress)
     {
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
         final boolean split = SPLIT_LONGS;
         long input = inputAddress;
         long match = matchAddress;
@@ -482,7 +851,7 @@ class DoubleFastBlockCompressor
         // first, compare long at a time
         int count = 0;
         while (count < remaining - (SIZE_OF_LONG - 1)) {
-            long diff = (split ? ((UNSAFE.getInt(inputBase, match) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, match + 4) << 32)) : UNSAFE.getLong(inputBase, match)) ^ (split ? ((UNSAFE.getInt(inputBase, input) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, input + 4) << 32)) : UNSAFE.getLong(inputBase, input));
+            long diff = (split ? ((unsafe.getInt(inputBase, match) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, match + 4) << 32)) : unsafe.getLong(inputBase, match)) ^ (split ? ((unsafe.getInt(inputBase, input) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, input + 4) << 32)) : unsafe.getLong(inputBase, input));
             if (diff != 0) {
                 return count + (Long.numberOfTrailingZeros(diff) >> 3);
             }
@@ -492,7 +861,7 @@ class DoubleFastBlockCompressor
             match += SIZE_OF_LONG;
         }
 
-        while (count < remaining && UNSAFE.getByte(inputBase, match) == UNSAFE.getByte(inputBase, input)) {
+        while (count < remaining && unsafe.getByte(inputBase, match) == unsafe.getByte(inputBase, input)) {
             count++;
             input++;
             match++;
