@@ -13,6 +13,8 @@
  */
 package io.airlift.compress.zstd;
 
+import sun.misc.Unsafe;
+
 import static io.airlift.compress.UnsafeUtil.SPLIT_LONGS;
 import static io.airlift.compress.UnsafeUtil.UNSAFE;
 import static io.airlift.compress.zstd.Constants.SIZE_OF_LONG;
@@ -64,15 +66,19 @@ class BitOutputStream
 
     public void flush()
     {
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
         final boolean split = SPLIT_LONGS;
         int bytes = bitCount >>> 3;
 
         if (split) {
-            UNSAFE.putInt(outputBase, currentAddress, (int) container);
-            UNSAFE.putInt(outputBase, currentAddress + 4, (int) (container >>> 32));
+            unsafe.putInt(outputBase, currentAddress, (int) container);
+            unsafe.putInt(outputBase, currentAddress + 4, (int) (container >>> 32));
         }
         else {
-            UNSAFE.putLong(outputBase, currentAddress, container);
+            unsafe.putLong(outputBase, currentAddress, container);
         }
         currentAddress += bytes;
 

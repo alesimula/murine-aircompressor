@@ -15,6 +15,8 @@ package io.airlift.compress.zstd;
 
 import io.airlift.compress.MalformedInputException;
 
+import sun.misc.Unsafe;
+
 import static io.airlift.compress.UnsafeUtil.UNSAFE;
 import static io.airlift.compress.zstd.Constants.SIZE_OF_SHORT;
 
@@ -109,14 +111,22 @@ final class Util
 
     public static int get24BitLittleEndian(Object inputBase, long inputAddress)
     {
-        return (UNSAFE.getShort(inputBase, inputAddress) & 0xFFFF)
-                | ((UNSAFE.getByte(inputBase, inputAddress + SIZE_OF_SHORT) & 0xFF) << Short.SIZE);
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
+        return (unsafe.getShort(inputBase, inputAddress) & 0xFFFF)
+                | ((unsafe.getByte(inputBase, inputAddress + SIZE_OF_SHORT) & 0xFF) << Short.SIZE);
     }
 
     public static void put24BitLittleEndian(Object outputBase, long outputAddress, int value)
     {
-        UNSAFE.putShort(outputBase, outputAddress, (short) value);
-        UNSAFE.putByte(outputBase, outputAddress + SIZE_OF_SHORT, (byte) (value >>> Short.SIZE));
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
+        unsafe.putShort(outputBase, outputAddress, (short) value);
+        unsafe.putByte(outputBase, outputAddress + SIZE_OF_SHORT, (byte) (value >>> Short.SIZE));
     }
 
     // provides the minimum logSize to safely represent a distribution
