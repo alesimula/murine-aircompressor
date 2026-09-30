@@ -120,15 +120,48 @@ class Huffman
             ranks[i] = current;
         }
 
+        // ARM/ART: the range of each symbol in locals (ranks[weight] was re-read for every entry: ART can't tell
+        // two int[] apart) and, for lengths >= 4 (lengths are powers of 2), 4 entries per step with two long
+        // stores, like native HUF_readDTableX1. The ranges tile the 1 << tableLog entries exactly (their lengths
+        // add up to total), so the unchecked stores stay inside the array.
+        final boolean split = SPLIT_LONGS;
+        final long arrayIntBaseOffset = ARRAY_INT_BASE_OFFSET;
+        // (the field in a local: after an Unsafe store ART reloads it, with a read barrier, at every use)
+        final int[] entries = this.entries;
+        final int[] ranks = this.ranks;
+        final byte[] weights = this.weights;
         for (int n = 0; n < numberOfSymbols; n++) {
             int weight = weights[n];
             int length = (1 << weight) >> 1;  // TODO: 1 << (weight - 1) ??
 
             int entry = (tableLog + 1 - weight) | n << 8;
-            for (int i = ranks[weight]; i < ranks[weight] + length; i++) {
-                entries[i] = entry;
+            int start = ranks[weight];
+            int end = start + length;
+            if (length >= 4) {
+                long pair = (entry & 0xFFFFFFFFL) | ((long) entry << 32);
+                long address = arrayIntBaseOffset + ((long) start << 2);
+                long limit = arrayIntBaseOffset + ((long) end << 2);
+                do {
+                    if (split) {
+                        unsafe.putInt(entries, address, entry);
+                        unsafe.putInt(entries, address + 4, entry);
+                        unsafe.putInt(entries, address + 8, entry);
+                        unsafe.putInt(entries, address + 12, entry);
+                    }
+                    else {
+                        unsafe.putLong(entries, address, pair);
+                        unsafe.putLong(entries, address + 8, pair);
+                    }
+                    address += 16;
+                }
+                while (address < limit);
             }
-            ranks[weight] += length;
+            else {
+                for (int i = start; i < end; i++) {
+                    entries[i] = entry;
+                }
+            }
+            ranks[weight] = end;
         }
 
         verify(ranks[1] >= 2 && (ranks[1] & 1) == 0, input, "Input is corrupted");
@@ -270,6 +303,12 @@ class Huffman
                 long window4 = (stream4bits | 1) << stream4bitsConsumed;
                 if (!split) {
                     do {
+                        // ARM/ART: the run ends at an output address instead of counting iterations down (one
+                        // loop-carried value less: the counter was kept on the stack)
+                        long output1Limit = output1 + (iterations << 2);
+                        // ARM/ART: one output address for the 4 streams (the segments are segmentSize apart):
+                        // two registers less for ART's allocator, which spilled values of this loop
+                        final long segment = segmentSize;
                         do {
                             int e;
                             e = unsafe.getInt(entries, arrayIntBaseOffset + ((window1 >>> fastShift) << 2));
@@ -321,13 +360,10 @@ class Huffman
                             window4 <<= e;
                             out4 |= (e & 0xFF00) << 16;
                             unsafe.putInt(outputBase, output1, out1);
-                            unsafe.putInt(outputBase, output2, out2);
-                            unsafe.putInt(outputBase, output3, out3);
-                            unsafe.putInt(outputBase, output4, out4);
+                            unsafe.putInt(outputBase, output1 + segment, out2);
+                            unsafe.putInt(outputBase, output1 + 2 * segment, out3);
+                            unsafe.putInt(outputBase, output1 + 3 * segment, out4);
                             output1 += SIZE_OF_INT;
-                            output2 += SIZE_OF_INT;
-                            output3 += SIZE_OF_INT;
-                            output4 += SIZE_OF_INT;
                             int consumed1 = Long.numberOfTrailingZeros(window1);
                             stream1currentAddress -= consumed1 >>> 3;
                             window1 = (unsafe.getLong(inputBase, stream1currentAddress) | 1) << (consumed1 & 0b111);
@@ -341,7 +377,10 @@ class Huffman
                             stream4currentAddress -= consumed4 >>> 3;
                             window4 = (unsafe.getLong(inputBase, stream4currentAddress) | 1) << (consumed4 & 0b111);
                         }
-                        while (--iterations > 0);
+                        while (output1 < output1Limit);
+                        output2 = output1 + segment;
+                        output3 = output1 + 2 * segment;
+                        output4 = output1 + 3 * segment;
                         iterations = (fastOutputLimit - output4 + 3) >> 2;
                         iterations = Math.min(iterations, (stream1currentAddress - start1) / 6);
                         iterations = Math.min(iterations, (stream2currentAddress - start2) / 6);
