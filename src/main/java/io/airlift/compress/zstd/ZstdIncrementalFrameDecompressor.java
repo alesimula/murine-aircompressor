@@ -304,6 +304,9 @@ public class ZstdIncrementalFrameDecompressor
                     if (checksum != (int) hash) {
                         throw new MalformedInputException(input, format("Bad checksum. Expected: %s, actual: %s", Integer.toHexString(checksum), Integer.toHexString((int) hash)));
                     }
+                    // verified: the output still pending in the window is flushed without hashing it again
+                    // (the flush above hashed every byte it copied while partialHash was set)
+                    partialHash = null;
                 }
                 state = State.READ_FRAME_MAGIC;
                 frameHeader = null;
@@ -369,6 +372,17 @@ public class ZstdIncrementalFrameDecompressor
                 if (wholeContent) {
                     newWindowSize = toIntExact(min(frameHeader.contentSize + MAX_BLOCK_SIZE, maxWindowSize));
                     newWindowSize = max(windowContentsSize + maxBlockOutput, newWindowSize);
+                }
+                else if (frameHeader.contentSize > requiredWindowSize && windowContentsSize == 0) {
+                    // content size known and larger than the window: allocate once what the doubling below would
+                    // end at (two windows plus a block: after each move to the front a whole window is free), or
+                    // the whole content plus a block when that is smaller. The doubling allocated and copied
+                    // 3 or 4 intermediate buffers per stream first.
+                    newWindowSize = toIntExact(min(frameHeader.contentSize + MAX_BLOCK_SIZE, min(2L * requiredWindowSize + MAX_BLOCK_SIZE, maxWindowSize)));
+                    newWindowSize = max(maxBlockOutput, newWindowSize);
+                    if (newWindowSize >= requiredWindowSize + MAX_BLOCK_SIZE && newWindowSize < settledWindowSize) {
+                        newWindowSize = settledWindowSize;
+                    }
                 }
                 else {
                     // double the current necessary window size
