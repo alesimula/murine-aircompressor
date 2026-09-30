@@ -17,6 +17,8 @@ import io.airlift.compress.MalformedInputException;
 
 import java.util.Arrays;
 
+import sun.misc.Unsafe;
+
 import static io.airlift.compress.UnsafeUtil.ARRAY_BYTE_BASE_OFFSET;
 import static io.airlift.compress.UnsafeUtil.SPLIT_LONGS;
 import static io.airlift.compress.UnsafeUtil.UNSAFE;
@@ -113,7 +115,20 @@ class ZstdFrameDecompressor
                     6, 4, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6,
                     6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6});
 
-    private final byte[] literals = new byte[MAX_BLOCK_SIZE + SIZE_OF_LONG]; // extra space to allow for long-at-a-time copy
+    private static final long[] DEFAULT_LITERALS_LENGTH_PACKED = pack(DEFAULT_LITERALS_LENGTH_TABLE, LITERALS_LENGTH_BASE, LITERALS_LENGTH_BITS, new long[1 << DEFAULT_LITERALS_LENGTH_TABLE.log2Size]);
+    private static final long[] DEFAULT_OFFSET_CODES_PACKED = pack(DEFAULT_OFFSET_CODES_TABLE, OFFSET_CODES_BASE, null, new long[1 << DEFAULT_OFFSET_CODES_TABLE.log2Size]);
+    private static final long[] DEFAULT_MATCH_LENGTH_PACKED = pack(DEFAULT_MATCH_LENGTH_TABLE, MATCH_LENGTH_BASE, MATCH_LENGTH_BITS, new long[1 << DEFAULT_MATCH_LENGTH_TABLE.log2Size]);
+
+    // offset codes: the code is its own number of extra bits (packed tables built by FseTableReader)
+    private static final int[] OFFSET_CODES_BITS = new int[DEFAULT_MAX_OFFSET_CODE_SYMBOL + 1];
+
+    static {
+        for (int code = 0; code < OFFSET_CODES_BITS.length; code++) {
+            OFFSET_CODES_BITS[code] = code;
+        }
+    }
+
+    private final byte[] literals = new byte[MAX_BLOCK_SIZE + 2 * SIZE_OF_LONG]; // extra space to allow for long-at-a-time copy
 
     // current buffer containing literals
     private Object literalsBase;
@@ -130,6 +145,33 @@ class ZstdFrameDecompressor
     private FiniteStateEntropy.Table currentOffsetCodesTable;
     private FiniteStateEntropy.Table currentMatchLengthTable;
 
+    // ARM/ART: sequence decoding tables packed like native zstd's ZSTD_seqSymbol, one long per state:
+    //   bits  0..15 next state base (newState), 16..23 state bits (numberOfBits),
+    //   bits 24..31 extra bits of the code, 32..63 base value of the code.
+    // decompressSequences then does 3 table reads per sequence instead of ~14 (each a bounds check
+    // on ART). Rebuilt only when a block brings a new table (RLE / compressed); repeat mode reuses it.
+    // The fields below bit 32 are read as (int) entry, so ARM32 extracts them from one register.
+    private final long[] literalsLengthPacked = new long[1 << LITERAL_LENGTH_TABLE_LOG];
+    private final long[] offsetCodesPacked = new long[1 << OFFSET_TABLE_LOG];
+    private final long[] matchLengthPacked = new long[1 << MATCH_LENGTH_TABLE_LOG];
+
+    // ARM/ART + register pressure: the three current packed tables side by side in one array, read with
+    // Unsafe in decompressSequences. States are absolute indexes into it (newState already carries the
+    // table's start), so the loop keeps one reference and does no bounds checks. A state is always
+    // < its table size by FSE construction (newState + (1 << numberOfBits) - 1 < tableSize), also for
+    // corrupt input, since the tables are built (and validated) here.
+    private static final int LITERALS_LENGTH_TABLE_START = 0;
+    private static final int OFFSET_CODES_TABLE_START = 1 << LITERAL_LENGTH_TABLE_LOG;
+    private static final int MATCH_LENGTH_TABLE_START = OFFSET_CODES_TABLE_START + (1 << OFFSET_TABLE_LOG);
+    private static final long ARRAY_LONG_BASE_OFFSET = UNSAFE.arrayBaseOffset(long[].class);
+    private final long[] sequenceTables = new long[MATCH_LENGTH_TABLE_START + (1 << MATCH_LENGTH_TABLE_LOG)];
+
+    private long[] currentLiteralsLengthPacked;
+    private long[] currentOffsetCodesPacked;
+    private long[] currentMatchLengthPacked;
+
+    private long remainingLiteralsInput;
+
     private final Huffman huffman = new Huffman();
     private final FseTableReader fse = new FseTableReader();
 
@@ -141,6 +183,10 @@ class ZstdFrameDecompressor
             final long outputAddress,
             final long outputLimit)
     {
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
         if (outputAddress == outputLimit) {
             return 0;
         }
@@ -205,7 +251,7 @@ class ZstdFrameDecompressor
                 long hash = hasher.hash();
 
                 verify(input + SIZE_OF_INT <= inputLimit, input, "Not enough input bytes");
-                int checksum = UNSAFE.getInt(inputBase, input);
+                int checksum = unsafe.getInt(inputBase, input);
                 if (checksum != (int) hash) {
                     throw new MalformedInputException(input, format("Bad checksum. Expected: %s, actual: %s", Integer.toHexString(checksum), Integer.toHexString((int) hash)));
                 }
@@ -226,6 +272,39 @@ class ZstdFrameDecompressor
         currentLiteralsLengthTable = null;
         currentOffsetCodesTable = null;
         currentMatchLengthTable = null;
+
+        currentLiteralsLengthPacked = null;
+        currentOffsetCodesPacked = null;
+        currentMatchLengthPacked = null;
+    }
+
+    // offsets: extraBitsTable == null, the code itself is the number of extra bits
+    private static void place(long[] tables, long[] packed, int log2Size, int start)
+    {
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final long arrayLongBaseOffset = ARRAY_LONG_BASE_OFFSET;
+        int size = 1 << log2Size;
+        for (int i = 0; i < size; i++) {
+            tables[start + i] = packed[i] + start; // newState (low 16 bits) becomes an absolute index
+            // ... stored as a byte offset: (index << 3) + the long[] base offset (see decompressSequences)
+            tables[start + i] = (tables[start + i] & ~0xFFFFL) | (((tables[start + i] & 0xFFFF) << 3) + arrayLongBaseOffset);
+        }
+    }
+
+    private static long[] pack(FiniteStateEntropy.Table table, int[] baseTable, int[] extraBitsTable, long[] packed)
+    {
+        int size = 1 << table.log2Size;
+        for (int state = 0; state < size; state++) {
+            int code = table.symbol[state];
+            int extraBits = extraBitsTable == null ? code : extraBitsTable[code];
+            packed[state] = ((long) baseTable[code] << 32)
+                    | (extraBits << 24)
+                    | ((table.numberOfBits[state] & 0xFF) << 16)
+                    | (table.newState[state] & 0xFFFF);
+        }
+        return packed;
     }
 
     static int decodeRawBlock(Object inputBase, long inputAddress, int blockSize, Object outputBase, long outputAddress, long outputLimit)
@@ -238,11 +317,15 @@ class ZstdFrameDecompressor
 
     static int decodeRleBlock(int size, Object inputBase, long inputAddress, Object outputBase, long outputAddress, long outputLimit)
     {
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
         final boolean split = SPLIT_LONGS;
         verify(outputAddress + size <= outputLimit, inputAddress, "Output buffer too small");
 
         long output = outputAddress;
-        long value = UNSAFE.getByte(inputBase, inputAddress) & 0xFFL;
+        long value = unsafe.getByte(inputBase, inputAddress) & 0xFFL;
 
         int remaining = size;
         if (remaining >= SIZE_OF_LONG) {
@@ -257,11 +340,11 @@ class ZstdFrameDecompressor
 
             do {
                 if (split) {
-                    UNSAFE.putInt(outputBase, output, (int) packed);
-                    UNSAFE.putInt(outputBase, output + 4, (int) (packed >>> 32));
+                    unsafe.putInt(outputBase, output, (int) packed);
+                    unsafe.putInt(outputBase, output + 4, (int) (packed >>> 32));
                 }
                 else {
-                    UNSAFE.putLong(outputBase, output, packed);
+                    unsafe.putLong(outputBase, output, packed);
                 }
                 output += SIZE_OF_LONG;
                 remaining -= SIZE_OF_LONG;
@@ -270,7 +353,7 @@ class ZstdFrameDecompressor
         }
 
         for (int i = 0; i < remaining; i++) {
-            UNSAFE.putByte(outputBase, output, (byte) value);
+            unsafe.putByte(outputBase, output, (byte) value);
             output++;
         }
 
@@ -287,6 +370,10 @@ class ZstdFrameDecompressor
             int windowSize,
             long outputAbsoluteBaseAddress)
     {
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
         long inputLimit = inputAddress + blockSize;
         long input = inputAddress;
 
@@ -294,7 +381,7 @@ class ZstdFrameDecompressor
         verify(blockSize >= MIN_BLOCK_SIZE, input, "Compressed block size too small");
 
         // decode literals
-        int literalsBlockType = UNSAFE.getByte(inputBase, input) & 0b11;
+        int literalsBlockType = unsafe.getByte(inputBase, input) & 0b11;
 
         switch (literalsBlockType) {
             case RAW_LITERALS_BLOCK: {
@@ -330,6 +417,11 @@ class ZstdFrameDecompressor
             final Object literalsBase, final long literalsAddress, final long literalsLimit,
             long outputAbsoluteBaseAddress)
     {
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
+        final long arrayLongBaseOffset = ARRAY_LONG_BASE_OFFSET;
         // ARM/ART: peekBits / peekBitsFast / verify are written out in this method. ART's inliner stops
         // inlining into a method once it passes ~1024 IR instructions (kMaximumNumberOfTotalInstructions;
         // only callees of <= 3 instructions still get inlined), and this method is past that, so each
@@ -337,6 +429,7 @@ class ZstdFrameDecompressor
         final boolean split = SPLIT_LONGS;
         final long fastOutputLimit = outputLimit - SIZE_OF_LONG;
         final long fastMatchOutputLimit = fastOutputLimit - SIZE_OF_LONG;
+        final long wildOutputLimit = outputLimit - 4 * SIZE_OF_LONG;
 
         long input = inputAddress;
         long output = outputAddress;
@@ -349,27 +442,27 @@ class ZstdFrameDecompressor
         }
 
         // decode header
-        int sequenceCount = UNSAFE.getByte(inputBase, input++) & 0xFF;
+        int sequenceCount = unsafe.getByte(inputBase, input++) & 0xFF;
         if (sequenceCount != 0) {
             if (sequenceCount == 255) {
                 if (!(input + SIZE_OF_SHORT <= inputLimit)) {
                     throw fail(input, "Not enough input bytes");
                 }
-                sequenceCount = (UNSAFE.getShort(inputBase, input) & 0xFFFF) + LONG_NUMBER_OF_SEQUENCES;
+                sequenceCount = (unsafe.getShort(inputBase, input) & 0xFFFF) + LONG_NUMBER_OF_SEQUENCES;
                 input += SIZE_OF_SHORT;
             }
             else if (sequenceCount > 127) {
                 if (!(input < inputLimit)) {
                     throw fail(input, "Not enough input bytes");
                 }
-                sequenceCount = ((sequenceCount - 128) << 8) + (UNSAFE.getByte(inputBase, input++) & 0xFF);
+                sequenceCount = ((sequenceCount - 128) << 8) + (unsafe.getByte(inputBase, input++) & 0xFF);
             }
 
             if (!(input + SIZE_OF_INT <= inputLimit)) {
                 throw fail(input, "Not enough input bytes");
             }
 
-            byte type = UNSAFE.getByte(inputBase, input++);
+            byte type = unsafe.getByte(inputBase, input++);
 
             int literalsLengthType = (type & 0xFF) >>> 6;
             int offsetCodesType = (type >>> 4) & 0b11;
@@ -389,22 +482,24 @@ class ZstdFrameDecompressor
             FiniteStateEntropy.Table currentOffsetCodesTable = this.currentOffsetCodesTable;
             FiniteStateEntropy.Table currentMatchLengthTable = this.currentMatchLengthTable;
 
-            int literalsLengthState = (int) (((bits << bitsConsumed) >>> 1) >>> (63 - currentLiteralsLengthTable.log2Size));
+            long literalsLengthState = (((bits << bitsConsumed) >>> 1) >>> (63 - currentLiteralsLengthTable.log2Size));
             bitsConsumed += currentLiteralsLengthTable.log2Size;
 
-            int offsetCodesState = (int) (((bits << bitsConsumed) >>> 1) >>> (63 - currentOffsetCodesTable.log2Size));
+            long offsetCodesState = (((bits << bitsConsumed) >>> 1) >>> (63 - currentOffsetCodesTable.log2Size));
             bitsConsumed += currentOffsetCodesTable.log2Size;
 
-            int matchLengthState = (int) (((bits << bitsConsumed) >>> 1) >>> (63 - currentMatchLengthTable.log2Size));
+            long matchLengthState = (((bits << bitsConsumed) >>> 1) >>> (63 - currentMatchLengthTable.log2Size));
             bitsConsumed += currentMatchLengthTable.log2Size;
 
             // ARM/ART: hoist the static code tables - a static array access is a barriered
             // reference load per use on ART; these were read up to 5x per decoded sequence
-            int[] literalsLengthBitsTable = LITERALS_LENGTH_BITS;
-            int[] matchLengthBitsTable = MATCH_LENGTH_BITS;
-            int[] literalsLengthBaseTable = LITERALS_LENGTH_BASE;
-            int[] matchLengthBaseTable = MATCH_LENGTH_BASE;
-            int[] offsetCodesBaseTable = OFFSET_CODES_BASE;
+            // (the code tables are now folded into the packed entries below)
+            // one packed entry per state (see literalsLengthPacked)
+            long[] sequenceTables = this.sequenceTables;
+            // (the tables are placed in sequenceTables when read, see computeLiteralsTable & co.)
+            literalsLengthState = ((literalsLengthState + LITERALS_LENGTH_TABLE_START) << 3) + arrayLongBaseOffset;
+            offsetCodesState = ((offsetCodesState + OFFSET_CODES_TABLE_START) << 3) + arrayLongBaseOffset;
+            matchLengthState = ((matchLengthState + MATCH_LENGTH_TABLE_START) << 3) + arrayLongBaseOffset;
 
             // ARM/ART: the three repeat offsets live in locals for the whole block and are written
             // back once after the loop. As array elements they were re-read and re-written with
@@ -415,19 +510,596 @@ class ZstdFrameDecompressor
             int repeatOffset1 = previousOffsets[1];
             int repeatOffset2 = previousOffsets[2];
 
-            byte[] literalsLengthNumbersOfBits = currentLiteralsLengthTable.numberOfBits;
-            int[] literalsLengthNewStates = currentLiteralsLengthTable.newState;
-            byte[] literalsLengthSymbols = currentLiteralsLengthTable.symbol;
+            // ARM/ART: the main loop has no calls, not even on rare paths. ART's register allocator spills a
+            // value that is live across any call at its definition, so one helper call made the states,
+            // bits and repeat offsets go through the stack on every sequence. A sequence too close to the
+            // end of the output for wild copies is left (decoded) to the general loop below.
+            int[] decrement32 = DEC_32_TABLE;
+            int[] decrement64 = DEC_64_TABLE;
+            boolean pending = false;
+            int pendingLiteralsLength = 0;
+            int pendingMatchLength = 0;
+            int pendingOffset = 0;
+            if (!split) {
+                while (sequenceCount > 0) {
+                    sequenceCount--;
 
-            byte[] matchLengthNumbersOfBits = currentMatchLengthTable.numberOfBits;
-            int[] matchLengthNewStates = currentMatchLengthTable.newState;
-            byte[] matchLengthSymbols = currentMatchLengthTable.symbol;
+                    // ARM/ART: BitInputStream.loadBits inlined here - removes a call and the long[]
+                    // scratch round-trip per sequence, so bits/currentAddress/bitsConsumed stay in
+                    // registers. Logic is identical to loadBits; LOAD_DONE was never read by this
+                    // caller, and the overflow case breaks out before any state is used.
+                    if (bitsConsumed > 64) {
+                        if (!(sequenceCount == 0)) {
+                            throw fail(input, "Not all sequences were consumed");
+                        }
+                        break;
+                    }
+                    if (currentAddress >= input + SIZE_OF_LONG) {
+                        // common case, >= 8 bytes left: like native BIT_reloadDStream, reload unconditionally
+                        // (a reload of 0 bytes reads the same word again)
+                        currentAddress -= bitsConsumed >>> 3;
+                        bits = unsafe.getLong(inputBase, currentAddress);
+                        bitsConsumed &= 0b111;
+                    }
+                    else if (currentAddress != input) {
+                        int refillBytes = bitsConsumed >>> 3;
+                        if (currentAddress - refillBytes < input) {
+                            refillBytes = (int) (currentAddress - input);
+                            currentAddress = input;
+                            bitsConsumed -= refillBytes * SIZE_OF_LONG;
+                            bits = unsafe.getLong(inputBase, input);
+                        }
+                        else {
+                            currentAddress -= refillBytes;
+                            bitsConsumed -= refillBytes * SIZE_OF_LONG;
+                            bits = unsafe.getLong(inputBase, currentAddress);
+                        }
+                    }
 
-            byte[] offsetCodesNumbersOfBits = currentOffsetCodesTable.numberOfBits;
-            int[] offsetCodesNewStates = currentOffsetCodesTable.newState;
-            byte[] offsetCodesSymbols = currentOffsetCodesTable.symbol;
+                    // decode sequence
+                    // one packed entry per table (see literalsLengthPacked)
+                    long literalsLengthEntry = unsafe.getLong(sequenceTables, literalsLengthState);
+                    long matchLengthEntry = unsafe.getLong(sequenceTables, matchLengthState);
+                    long offsetCodesEntry = unsafe.getLong(sequenceTables, offsetCodesState);
 
-            while (sequenceCount > 0) {
+                    int literalsLengthBits = (int) literalsLengthEntry >>> 24;
+                    int matchLengthBits = (int) matchLengthEntry >>> 24;
+                    int offsetBits = (int) offsetCodesEntry >>> 24; // == offset code
+
+                    int offset = (int) (offsetCodesEntry >>> 32);
+                    if (offsetBits > 0) { // offset code > 0
+                        offset += (int) ((bits << bitsConsumed) >>> (64 - offsetBits)); // offsetBits > 0: two shifts
+                        bitsConsumed += offsetBits;
+                    }
+
+                    int literalsLengthBase = (int) (literalsLengthEntry >>> 32);
+                    if (offsetBits <= 1) { // offset code <= 1
+                        if (literalsLengthBase == 0) { // literals length code 0 is the only code with base 0
+                            offset++;
+                        }
+
+                        if (offset != 0) {
+                            int temp;
+                            if (offset == 3) {
+                                temp = repeatOffset0 - 1;
+                            }
+                            else {
+                                temp = offset == 1 ? repeatOffset1 : repeatOffset2; // offset is 1 or 2 here
+                            }
+
+                            if (temp == 0) {
+                                temp = 1;
+                            }
+
+                            if (offset != 1) {
+                                repeatOffset2 = repeatOffset1;
+                            }
+                            repeatOffset1 = repeatOffset0;
+                            repeatOffset0 = temp;
+
+                            offset = temp;
+                        }
+                        else {
+                            offset = repeatOffset0;
+                        }
+                    }
+                    else {
+                        repeatOffset2 = repeatOffset1;
+                        repeatOffset1 = repeatOffset0;
+                        repeatOffset0 = offset;
+                    }
+
+                    int matchLength = (int) (matchLengthEntry >>> 32);
+                    if (matchLengthBits > 0) { // match length codes > 31 are the ones with extra bits
+                        matchLength += (int) ((bits << bitsConsumed) >>> (64 - matchLengthBits)); // matchLengthBits > 0: two shifts
+                        bitsConsumed += matchLengthBits;
+                    }
+
+                    int literalsLength = literalsLengthBase;
+                    if (literalsLengthBits > 0) { // literals length codes > 15 are the ones with extra bits
+                        literalsLength += (int) ((bits << bitsConsumed) >>> (64 - literalsLengthBits)); // literalsLengthBits > 0: two shifts
+                        bitsConsumed += literalsLengthBits;
+                    }
+
+                    int totalBits = literalsLengthBits + matchLengthBits + offsetBits;
+                    if (totalBits > 64 - 7 - (LITERAL_LENGTH_TABLE_LOG + MATCH_LENGTH_TABLE_LOG + OFFSET_TABLE_LOG)
+                            && bitsConsumed <= 64 && currentAddress != input) {
+                        // loadBits inlined (see above). Overflow / at-start both leave state untouched,
+                        // which is exactly what the guard conditions above express.
+                        int refillBytes = bitsConsumed >>> 3;
+                        if (currentAddress >= input + SIZE_OF_LONG) {
+                            if (refillBytes > 0) {
+                                currentAddress -= refillBytes;
+                                bits = unsafe.getLong(inputBase, currentAddress);
+                            }
+                            bitsConsumed &= 0b111;
+                        }
+                        else if (currentAddress - refillBytes < input) {
+                            refillBytes = (int) (currentAddress - input);
+                            currentAddress = input;
+                            bitsConsumed -= refillBytes * SIZE_OF_LONG;
+                            bits = unsafe.getLong(inputBase, input);
+                        }
+                        else {
+                            currentAddress -= refillBytes;
+                            bitsConsumed -= refillBytes * SIZE_OF_LONG;
+                            bits = unsafe.getLong(inputBase, currentAddress);
+                        }
+                    }
+
+                    int numberOfBits;
+
+                    numberOfBits = ((int) literalsLengthEntry >>> 16) & 0xFF;
+                    literalsLengthState = (literalsLengthEntry & 0xFFFF) + ((((bits << bitsConsumed) >>> 1) >>> (63 - numberOfBits)) << 3); // <= 9 bits
+                    bitsConsumed += numberOfBits;
+
+                    numberOfBits = ((int) matchLengthEntry >>> 16) & 0xFF;
+                    matchLengthState = (matchLengthEntry & 0xFFFF) + ((((bits << bitsConsumed) >>> 1) >>> (63 - numberOfBits)) << 3); // <= 9 bits
+                    bitsConsumed += numberOfBits;
+
+                    numberOfBits = ((int) offsetCodesEntry >>> 16) & 0xFF;
+                    offsetCodesState = (offsetCodesEntry & 0xFFFF) + ((((bits << bitsConsumed) >>> 1) >>> (63 - numberOfBits)) << 3); // <= 8 bits
+                    bitsConsumed += numberOfBits;
+
+                    final long literalOutputLimit = output + literalsLength;
+                    final long matchOutputLimit = literalOutputLimit + matchLength;
+
+                    long literalEnd = literalsInput + literalsLength;
+                    if (!(literalEnd <= literalsLimit)) {
+                        throw fail(input, "Input is corrupted");
+                    }
+
+                    long matchAddress = literalOutputLimit - offset;
+                    if (!(matchAddress >= outputAbsoluteBaseAddress)) {
+                        throw fail(input, "Input is corrupted");
+                    }
+
+                    if (matchOutputLimit > wildOutputLimit) {
+                        // near the end of the output: the general loop below executes it
+                        pendingLiteralsLength = literalsLength;
+                        pendingMatchLength = matchLength;
+                        pendingOffset = offset;
+                        pending = true;
+                        break;
+                    }
+                    // ---- begin inlined literal / match copies (no calls, see above) ----
+                    {
+                        long v = unsafe.getLong(literalsBase, literalsInput);
+                        unsafe.putLong(outputBase, output, v);
+                    }
+                    {
+                        long v = unsafe.getLong(literalsBase, literalsInput + SIZE_OF_LONG);
+                        unsafe.putLong(outputBase, output + SIZE_OF_LONG, v);
+                    }
+                    if (literalsLength > 2 * SIZE_OF_LONG) {
+                        long copyOutput = output + 2 * SIZE_OF_LONG;
+                        long copyInput = literalsInput + 2 * SIZE_OF_LONG;
+                        do {
+                            {
+                                long v = unsafe.getLong(literalsBase, copyInput);
+                                unsafe.putLong(outputBase, copyOutput, v);
+                            }
+                            copyOutput += SIZE_OF_LONG;
+                            copyInput += SIZE_OF_LONG;
+                        }
+                        while (copyOutput < literalOutputLimit);
+                    }
+                    output = literalOutputLimit;
+                    if (offset >= 2 * SIZE_OF_LONG) {
+                        {
+                            long v = unsafe.getLong(outputBase, matchAddress);
+                            unsafe.putLong(outputBase, output, v);
+                        }
+                        {
+                            long v = unsafe.getLong(outputBase, matchAddress + SIZE_OF_LONG);
+                            unsafe.putLong(outputBase, output + SIZE_OF_LONG, v);
+                        }
+                        if (matchLength > 2 * SIZE_OF_LONG) {
+                            long copyOutput = output + 2 * SIZE_OF_LONG;
+                            long copyInput = matchAddress + 2 * SIZE_OF_LONG;
+                            do {
+                                {
+                                    long v = unsafe.getLong(outputBase, copyInput);
+                                    unsafe.putLong(outputBase, copyOutput, v);
+                                }
+                                copyOutput += SIZE_OF_LONG;
+                                copyInput += SIZE_OF_LONG;
+                            }
+                            while (copyOutput < matchOutputLimit);
+                        }
+                    }
+                    else {
+                        long copyInput = matchAddress;
+                        long copyOutput = output;
+                        if (offset < SIZE_OF_LONG) {
+                            // the first 8 bytes repeat the first `offset` bytes (see copyMatchHead); after them the
+                            // source is moved back so that it trails the output by a multiple of offset >= 8
+                            long pattern = unsafe.getLong(outputBase, matchAddress);
+                            int period = offset * Byte.SIZE;
+                            pattern &= (1L << period) - 1;
+                            pattern |= pattern << period;
+                            if (offset < 4) {
+                                pattern |= pattern << (period * 2);
+                                if (offset < 2) {
+                                    pattern |= pattern << (period * 4);
+                                }
+                            }
+                            unsafe.putLong(outputBase, output, pattern);
+                            copyInput += decrement32[offset] - decrement64[offset];
+                            copyOutput += SIZE_OF_LONG;
+                        }
+                        while (copyOutput < matchOutputLimit) {
+                            {
+                                long v = unsafe.getLong(outputBase, copyInput);
+                                unsafe.putLong(outputBase, copyOutput, v);
+                            }
+                            copyOutput += SIZE_OF_LONG;
+                            copyInput += SIZE_OF_LONG;
+                        }
+                    }
+                    // ---- end inlined literal / match copies ----
+                    output = matchOutputLimit;
+                    literalsInput = literalEnd;
+                }
+            }
+            else {
+                while (sequenceCount > 0) {
+                    sequenceCount--;
+
+                    // ARM/ART: BitInputStream.loadBits inlined here - removes a call and the long[]
+                    // scratch round-trip per sequence, so bits/currentAddress/bitsConsumed stay in
+                    // registers. Logic is identical to loadBits; LOAD_DONE was never read by this
+                    // caller, and the overflow case breaks out before any state is used.
+                    if (bitsConsumed > 64) {
+                        if (!(sequenceCount == 0)) {
+                            throw fail(input, "Not all sequences were consumed");
+                        }
+                        break;
+                    }
+                    if (currentAddress >= input + SIZE_OF_LONG) {
+                        // common case, >= 8 bytes left: like native BIT_reloadDStream, reload unconditionally
+                        // (a reload of 0 bytes reads the same word again)
+                        currentAddress -= bitsConsumed >>> 3;
+                        bits = (split ? ((unsafe.getInt(inputBase, currentAddress) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, currentAddress + 4) << 32)) : unsafe.getLong(inputBase, currentAddress));
+                        bitsConsumed &= 0b111;
+                    }
+                    else if (currentAddress != input) {
+                        int refillBytes = bitsConsumed >>> 3;
+                        if (currentAddress - refillBytes < input) {
+                            refillBytes = (int) (currentAddress - input);
+                            currentAddress = input;
+                            bitsConsumed -= refillBytes * SIZE_OF_LONG;
+                            bits = (split ? ((unsafe.getInt(inputBase, input) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, input + 4) << 32)) : unsafe.getLong(inputBase, input));
+                        }
+                        else {
+                            currentAddress -= refillBytes;
+                            bitsConsumed -= refillBytes * SIZE_OF_LONG;
+                            bits = (split ? ((unsafe.getInt(inputBase, currentAddress) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, currentAddress + 4) << 32)) : unsafe.getLong(inputBase, currentAddress));
+                        }
+                    }
+
+                    // decode sequence
+                    // one packed entry per table (see literalsLengthPacked)
+                    long literalsLengthEntry = unsafe.getLong(sequenceTables, literalsLengthState);
+                    long matchLengthEntry = unsafe.getLong(sequenceTables, matchLengthState);
+                    long offsetCodesEntry = unsafe.getLong(sequenceTables, offsetCodesState);
+
+                    int literalsLengthBits = (int) literalsLengthEntry >>> 24;
+                    int matchLengthBits = (int) matchLengthEntry >>> 24;
+                    int offsetBits = (int) offsetCodesEntry >>> 24; // == offset code
+
+                    int offset = (int) (offsetCodesEntry >>> 32);
+                    if (offsetBits > 0) { // offset code > 0
+                        offset += (int) ((bits << bitsConsumed) >>> (64 - offsetBits)); // offsetBits > 0: two shifts
+                        bitsConsumed += offsetBits;
+                    }
+
+                    int literalsLengthBase = (int) (literalsLengthEntry >>> 32);
+                    if (offsetBits <= 1) { // offset code <= 1
+                        if (literalsLengthBase == 0) { // literals length code 0 is the only code with base 0
+                            offset++;
+                        }
+
+                        if (offset != 0) {
+                            int temp;
+                            if (offset == 3) {
+                                temp = repeatOffset0 - 1;
+                            }
+                            else {
+                                temp = offset == 1 ? repeatOffset1 : repeatOffset2; // offset is 1 or 2 here
+                            }
+
+                            if (temp == 0) {
+                                temp = 1;
+                            }
+
+                            if (offset != 1) {
+                                repeatOffset2 = repeatOffset1;
+                            }
+                            repeatOffset1 = repeatOffset0;
+                            repeatOffset0 = temp;
+
+                            offset = temp;
+                        }
+                        else {
+                            offset = repeatOffset0;
+                        }
+                    }
+                    else {
+                        repeatOffset2 = repeatOffset1;
+                        repeatOffset1 = repeatOffset0;
+                        repeatOffset0 = offset;
+                    }
+
+                    int matchLength = (int) (matchLengthEntry >>> 32);
+                    if (matchLengthBits > 0) { // match length codes > 31 are the ones with extra bits
+                        matchLength += (int) ((bits << bitsConsumed) >>> (64 - matchLengthBits)); // matchLengthBits > 0: two shifts
+                        bitsConsumed += matchLengthBits;
+                    }
+
+                    int literalsLength = literalsLengthBase;
+                    if (literalsLengthBits > 0) { // literals length codes > 15 are the ones with extra bits
+                        literalsLength += (int) ((bits << bitsConsumed) >>> (64 - literalsLengthBits)); // literalsLengthBits > 0: two shifts
+                        bitsConsumed += literalsLengthBits;
+                    }
+
+                    int totalBits = literalsLengthBits + matchLengthBits + offsetBits;
+                    if (totalBits > 64 - 7 - (LITERAL_LENGTH_TABLE_LOG + MATCH_LENGTH_TABLE_LOG + OFFSET_TABLE_LOG)
+                            && bitsConsumed <= 64 && currentAddress != input) {
+                        // loadBits inlined (see above). Overflow / at-start both leave state untouched,
+                        // which is exactly what the guard conditions above express.
+                        int refillBytes = bitsConsumed >>> 3;
+                        if (currentAddress >= input + SIZE_OF_LONG) {
+                            if (refillBytes > 0) {
+                                currentAddress -= refillBytes;
+                                bits = (split ? ((unsafe.getInt(inputBase, currentAddress) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, currentAddress + 4) << 32)) : unsafe.getLong(inputBase, currentAddress));
+                            }
+                            bitsConsumed &= 0b111;
+                        }
+                        else if (currentAddress - refillBytes < input) {
+                            refillBytes = (int) (currentAddress - input);
+                            currentAddress = input;
+                            bitsConsumed -= refillBytes * SIZE_OF_LONG;
+                            bits = (split ? ((unsafe.getInt(inputBase, input) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, input + 4) << 32)) : unsafe.getLong(inputBase, input));
+                        }
+                        else {
+                            currentAddress -= refillBytes;
+                            bitsConsumed -= refillBytes * SIZE_OF_LONG;
+                            bits = (split ? ((unsafe.getInt(inputBase, currentAddress) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, currentAddress + 4) << 32)) : unsafe.getLong(inputBase, currentAddress));
+                        }
+                    }
+
+                    int numberOfBits;
+
+                    numberOfBits = ((int) literalsLengthEntry >>> 16) & 0xFF;
+                    literalsLengthState = (literalsLengthEntry & 0xFFFF) + ((((bits << bitsConsumed) >>> 1) >>> (63 - numberOfBits)) << 3); // <= 9 bits
+                    bitsConsumed += numberOfBits;
+
+                    numberOfBits = ((int) matchLengthEntry >>> 16) & 0xFF;
+                    matchLengthState = (matchLengthEntry & 0xFFFF) + ((((bits << bitsConsumed) >>> 1) >>> (63 - numberOfBits)) << 3); // <= 9 bits
+                    bitsConsumed += numberOfBits;
+
+                    numberOfBits = ((int) offsetCodesEntry >>> 16) & 0xFF;
+                    offsetCodesState = (offsetCodesEntry & 0xFFFF) + ((((bits << bitsConsumed) >>> 1) >>> (63 - numberOfBits)) << 3); // <= 8 bits
+                    bitsConsumed += numberOfBits;
+
+                    final long literalOutputLimit = output + literalsLength;
+                    final long matchOutputLimit = literalOutputLimit + matchLength;
+
+                    long literalEnd = literalsInput + literalsLength;
+                    if (!(literalEnd <= literalsLimit)) {
+                        throw fail(input, "Input is corrupted");
+                    }
+
+                    long matchAddress = literalOutputLimit - offset;
+                    if (!(matchAddress >= outputAbsoluteBaseAddress)) {
+                        throw fail(input, "Input is corrupted");
+                    }
+
+                    if (matchOutputLimit > wildOutputLimit) {
+                        // near the end of the output: the general loop below executes it
+                        pendingLiteralsLength = literalsLength;
+                        pendingMatchLength = matchLength;
+                        pendingOffset = offset;
+                        pending = true;
+                        break;
+                    }
+                    // ---- begin inlined literal / match copies (no calls, see above) ----
+                    {
+                        long v = (split ? ((unsafe.getInt(literalsBase, literalsInput) & 0xFFFFFFFFL) | ((long) unsafe.getInt(literalsBase, literalsInput + 4) << 32)) : unsafe.getLong(literalsBase, literalsInput));
+                        if (split) {
+                            unsafe.putInt(outputBase, output, (int) v);
+                            unsafe.putInt(outputBase, output + 4, (int) (v >>> 32));
+                        }
+                        else {
+                            unsafe.putLong(outputBase, output, v);
+                        }
+                    }
+                    {
+                        long v = (split ? ((unsafe.getInt(literalsBase, literalsInput + SIZE_OF_LONG) & 0xFFFFFFFFL) | ((long) unsafe.getInt(literalsBase, literalsInput + SIZE_OF_LONG + 4) << 32)) : unsafe.getLong(literalsBase, literalsInput + SIZE_OF_LONG));
+                        if (split) {
+                            unsafe.putInt(outputBase, output + SIZE_OF_LONG, (int) v);
+                            unsafe.putInt(outputBase, output + SIZE_OF_LONG + 4, (int) (v >>> 32));
+                        }
+                        else {
+                            unsafe.putLong(outputBase, output + SIZE_OF_LONG, v);
+                        }
+                    }
+                    if (literalsLength > 2 * SIZE_OF_LONG) {
+                        long copyOutput = output + 2 * SIZE_OF_LONG;
+                        long copyInput = literalsInput + 2 * SIZE_OF_LONG;
+                        do {
+                            {
+                                long v = (split ? ((unsafe.getInt(literalsBase, copyInput) & 0xFFFFFFFFL) | ((long) unsafe.getInt(literalsBase, copyInput + 4) << 32)) : unsafe.getLong(literalsBase, copyInput));
+                                if (split) {
+                                    unsafe.putInt(outputBase, copyOutput, (int) v);
+                                    unsafe.putInt(outputBase, copyOutput + 4, (int) (v >>> 32));
+                                }
+                                else {
+                                    unsafe.putLong(outputBase, copyOutput, v);
+                                }
+                            }
+                            copyOutput += SIZE_OF_LONG;
+                            copyInput += SIZE_OF_LONG;
+                        }
+                        while (copyOutput < literalOutputLimit);
+                    }
+                    output = literalOutputLimit;
+                    if (offset >= 2 * SIZE_OF_LONG) {
+                        {
+                            long v = (split ? ((unsafe.getInt(outputBase, matchAddress) & 0xFFFFFFFFL) | ((long) unsafe.getInt(outputBase, matchAddress + 4) << 32)) : unsafe.getLong(outputBase, matchAddress));
+                            if (split) {
+                                unsafe.putInt(outputBase, output, (int) v);
+                                unsafe.putInt(outputBase, output + 4, (int) (v >>> 32));
+                            }
+                            else {
+                                unsafe.putLong(outputBase, output, v);
+                            }
+                        }
+                        {
+                            long v = (split ? ((unsafe.getInt(outputBase, matchAddress + SIZE_OF_LONG) & 0xFFFFFFFFL) | ((long) unsafe.getInt(outputBase, matchAddress + SIZE_OF_LONG + 4) << 32)) : unsafe.getLong(outputBase, matchAddress + SIZE_OF_LONG));
+                            if (split) {
+                                unsafe.putInt(outputBase, output + SIZE_OF_LONG, (int) v);
+                                unsafe.putInt(outputBase, output + SIZE_OF_LONG + 4, (int) (v >>> 32));
+                            }
+                            else {
+                                unsafe.putLong(outputBase, output + SIZE_OF_LONG, v);
+                            }
+                        }
+                        if (matchLength > 2 * SIZE_OF_LONG) {
+                            long copyOutput = output + 2 * SIZE_OF_LONG;
+                            long copyInput = matchAddress + 2 * SIZE_OF_LONG;
+                            do {
+                                {
+                                    long v = (split ? ((unsafe.getInt(outputBase, copyInput) & 0xFFFFFFFFL) | ((long) unsafe.getInt(outputBase, copyInput + 4) << 32)) : unsafe.getLong(outputBase, copyInput));
+                                    if (split) {
+                                        unsafe.putInt(outputBase, copyOutput, (int) v);
+                                        unsafe.putInt(outputBase, copyOutput + 4, (int) (v >>> 32));
+                                    }
+                                    else {
+                                        unsafe.putLong(outputBase, copyOutput, v);
+                                    }
+                                }
+                                copyOutput += SIZE_OF_LONG;
+                                copyInput += SIZE_OF_LONG;
+                            }
+                            while (copyOutput < matchOutputLimit);
+                        }
+                    }
+                    else {
+                        long copyInput = matchAddress;
+                        long copyOutput = output;
+                        if (offset < SIZE_OF_LONG) {
+                            // the first 8 bytes repeat the first `offset` bytes (see copyMatchHead); after them the
+                            // source is moved back so that it trails the output by a multiple of offset >= 8
+                            long pattern = (split ? ((unsafe.getInt(outputBase, matchAddress) & 0xFFFFFFFFL) | ((long) unsafe.getInt(outputBase, matchAddress + 4) << 32)) : unsafe.getLong(outputBase, matchAddress));
+                            int period = offset * Byte.SIZE;
+                            pattern &= (1L << period) - 1;
+                            pattern |= pattern << period;
+                            if (offset < 4) {
+                                pattern |= pattern << (period * 2);
+                                if (offset < 2) {
+                                    pattern |= pattern << (period * 4);
+                                }
+                            }
+                            if (split) {
+                                unsafe.putInt(outputBase, output, (int) pattern);
+                                unsafe.putInt(outputBase, output + 4, (int) (pattern >>> 32));
+                            }
+                            else {
+                                unsafe.putLong(outputBase, output, pattern);
+                            }
+                            copyInput += decrement32[offset] - decrement64[offset];
+                            copyOutput += SIZE_OF_LONG;
+                        }
+                        while (copyOutput < matchOutputLimit) {
+                            {
+                                long v = (split ? ((unsafe.getInt(outputBase, copyInput) & 0xFFFFFFFFL) | ((long) unsafe.getInt(outputBase, copyInput + 4) << 32)) : unsafe.getLong(outputBase, copyInput));
+                                if (split) {
+                                    unsafe.putInt(outputBase, copyOutput, (int) v);
+                                    unsafe.putInt(outputBase, copyOutput + 4, (int) (v >>> 32));
+                                }
+                                else {
+                                    unsafe.putLong(outputBase, copyOutput, v);
+                                }
+                            }
+                            copyOutput += SIZE_OF_LONG;
+                            copyInput += SIZE_OF_LONG;
+                        }
+                    }
+                    // ---- end inlined literal / match copies ----
+                    output = matchOutputLimit;
+                    literalsInput = literalEnd;
+                }
+            }
+
+            previousOffsets[0] = repeatOffset0;
+            previousOffsets[1] = repeatOffset1;
+            previousOffsets[2] = repeatOffset2;
+            if (pending || sequenceCount > 0) {
+                // ARM/ART: in its own method, so that its calls don't make ART spill the loop above
+                output = decompressRemainingSequences(inputBase, input, currentAddress, bits, bitsConsumed,
+                        literalsLengthState, offsetCodesState, matchLengthState, sequenceTables,
+                        repeatOffset0, repeatOffset1, repeatOffset2, sequenceCount,
+                        pending, pendingLiteralsLength, pendingMatchLength, pendingOffset,
+                        outputBase, output, outputLimit, literalsBase, literalsInput, literalsLimit, outputAbsoluteBaseAddress);
+                literalsInput = remainingLiteralsInput;
+            }
+        }
+
+        // last literal segment
+        output = copyLastLiteral(input, literalsBase, literalsInput, literalsLimit, outputBase, output, outputLimit);
+
+        return (int) (output - outputAddress);
+    }
+
+    // the rest of a block's sequences once one ends too near the end of the output for wild copies (see
+    // decompressSequences); writes back the repeat offsets and remainingLiteralsInput, returns the output
+    private long decompressRemainingSequences(Object inputBase, long input, long currentAddress, long bits, int bitsConsumed,
+            long literalsLengthState, long offsetCodesState, long matchLengthState, long[] sequenceTables,
+            int repeatOffset0, int repeatOffset1, int repeatOffset2, int sequenceCount,
+            boolean pending, int pendingLiteralsLength, int pendingMatchLength, int pendingOffset,
+            Object outputBase, long output, long outputLimit, Object literalsBase, long literalsInput, long literalsLimit, long outputAbsoluteBaseAddress)
+    {
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
+        final boolean split = SPLIT_LONGS;
+        final long fastOutputLimit = outputLimit - SIZE_OF_LONG;
+        final long fastMatchOutputLimit = fastOutputLimit - SIZE_OF_LONG;
+        final long wildOutputLimit = outputLimit - 4 * SIZE_OF_LONG;
+        while (pending || sequenceCount > 0) {
+            int offset;
+            int matchLength;
+            int literalsLength;
+            if (pending) {
+                pending = false;
+                offset = pendingOffset;
+                matchLength = pendingMatchLength;
+                literalsLength = pendingLiteralsLength;
+            }
+            else {
                 sequenceCount--;
 
                 // ARM/ART: BitInputStream.loadBits inlined here - removes a call and the long[]
@@ -440,45 +1112,47 @@ class ZstdFrameDecompressor
                     }
                     break;
                 }
-                if (currentAddress != input) {
+                if (currentAddress >= input + SIZE_OF_LONG) {
+                    // common case, >= 8 bytes left: like native BIT_reloadDStream, reload unconditionally
+                    // (a reload of 0 bytes reads the same word again)
+                    currentAddress -= bitsConsumed >>> 3;
+                    bits = (split ? ((unsafe.getInt(inputBase, currentAddress) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, currentAddress + 4) << 32)) : unsafe.getLong(inputBase, currentAddress));
+                    bitsConsumed &= 0b111;
+                }
+                else if (currentAddress != input) {
                     int refillBytes = bitsConsumed >>> 3;
-                    if (currentAddress >= input + SIZE_OF_LONG) {
-                        if (refillBytes > 0) {
-                            currentAddress -= refillBytes;
-                            bits = (split ? ((UNSAFE.getInt(inputBase, currentAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, currentAddress + 4) << 32)) : UNSAFE.getLong(inputBase, currentAddress));
-                        }
-                        bitsConsumed &= 0b111;
-                    }
-                    else if (currentAddress - refillBytes < input) {
+                    if (currentAddress - refillBytes < input) {
                         refillBytes = (int) (currentAddress - input);
                         currentAddress = input;
                         bitsConsumed -= refillBytes * SIZE_OF_LONG;
-                        bits = (split ? ((UNSAFE.getInt(inputBase, input) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, input + 4) << 32)) : UNSAFE.getLong(inputBase, input));
+                        bits = (split ? ((unsafe.getInt(inputBase, input) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, input + 4) << 32)) : unsafe.getLong(inputBase, input));
                     }
                     else {
                         currentAddress -= refillBytes;
                         bitsConsumed -= refillBytes * SIZE_OF_LONG;
-                        bits = (split ? ((UNSAFE.getInt(inputBase, currentAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, currentAddress + 4) << 32)) : UNSAFE.getLong(inputBase, currentAddress));
+                        bits = (split ? ((unsafe.getInt(inputBase, currentAddress) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, currentAddress + 4) << 32)) : unsafe.getLong(inputBase, currentAddress));
                     }
                 }
 
                 // decode sequence
-                int literalsLengthCode = literalsLengthSymbols[literalsLengthState];
-                int matchLengthCode = matchLengthSymbols[matchLengthState];
-                int offsetCode = offsetCodesSymbols[offsetCodesState];
+                // one packed entry per table (see literalsLengthPacked)
+                long literalsLengthEntry = unsafe.getLong(sequenceTables, literalsLengthState);
+                long matchLengthEntry = unsafe.getLong(sequenceTables, matchLengthState);
+                long offsetCodesEntry = unsafe.getLong(sequenceTables, offsetCodesState);
 
-                int literalsLengthBits = literalsLengthBitsTable[literalsLengthCode];
-                int matchLengthBits = matchLengthBitsTable[matchLengthCode];
-                int offsetBits = offsetCode;
+                int literalsLengthBits = (int) literalsLengthEntry >>> 24;
+                int matchLengthBits = (int) matchLengthEntry >>> 24;
+                int offsetBits = (int) offsetCodesEntry >>> 24; // == offset code
 
-                int offset = offsetCodesBaseTable[offsetCode];
-                if (offsetCode > 0) {
-                    offset += (((bits << bitsConsumed) >>> 1) >>> (63 - offsetBits));
+                offset = (int) (offsetCodesEntry >>> 32);
+                if (offsetBits > 0) { // offset code > 0
+                    offset += (int) ((bits << bitsConsumed) >>> (64 - offsetBits)); // offsetBits > 0: two shifts
                     bitsConsumed += offsetBits;
                 }
 
-                if (offsetCode <= 1) {
-                    if (literalsLengthCode == 0) {
+                int literalsLengthBase = (int) (literalsLengthEntry >>> 32);
+                if (offsetBits <= 1) { // offset code <= 1
+                    if (literalsLengthBase == 0) { // literals length code 0 is the only code with base 0
                         offset++;
                     }
 
@@ -513,15 +1187,15 @@ class ZstdFrameDecompressor
                     repeatOffset0 = offset;
                 }
 
-                int matchLength = matchLengthBaseTable[matchLengthCode];
-                if (matchLengthCode > 31) {
-                    matchLength += (((bits << bitsConsumed) >>> 1) >>> (63 - matchLengthBits));
+                matchLength = (int) (matchLengthEntry >>> 32);
+                if (matchLengthBits > 0) { // match length codes > 31 are the ones with extra bits
+                    matchLength += (int) ((bits << bitsConsumed) >>> (64 - matchLengthBits)); // matchLengthBits > 0: two shifts
                     bitsConsumed += matchLengthBits;
                 }
 
-                int literalsLength = literalsLengthBaseTable[literalsLengthCode];
-                if (literalsLengthCode > 15) {
-                    literalsLength += (((bits << bitsConsumed) >>> 1) >>> (63 - literalsLengthBits));
+                literalsLength = literalsLengthBase;
+                if (literalsLengthBits > 0) { // literals length codes > 15 are the ones with extra bits
+                    literalsLength += (int) ((bits << bitsConsumed) >>> (64 - literalsLengthBits)); // literalsLengthBits > 0: two shifts
                     bitsConsumed += literalsLengthBits;
                 }
 
@@ -534,7 +1208,7 @@ class ZstdFrameDecompressor
                     if (currentAddress >= input + SIZE_OF_LONG) {
                         if (refillBytes > 0) {
                             currentAddress -= refillBytes;
-                            bits = (split ? ((UNSAFE.getInt(inputBase, currentAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, currentAddress + 4) << 32)) : UNSAFE.getLong(inputBase, currentAddress));
+                            bits = (split ? ((unsafe.getInt(inputBase, currentAddress) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, currentAddress + 4) << 32)) : unsafe.getLong(inputBase, currentAddress));
                         }
                         bitsConsumed &= 0b111;
                     }
@@ -542,112 +1216,174 @@ class ZstdFrameDecompressor
                         refillBytes = (int) (currentAddress - input);
                         currentAddress = input;
                         bitsConsumed -= refillBytes * SIZE_OF_LONG;
-                        bits = (split ? ((UNSAFE.getInt(inputBase, input) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, input + 4) << 32)) : UNSAFE.getLong(inputBase, input));
+                        bits = (split ? ((unsafe.getInt(inputBase, input) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, input + 4) << 32)) : unsafe.getLong(inputBase, input));
                     }
                     else {
                         currentAddress -= refillBytes;
                         bitsConsumed -= refillBytes * SIZE_OF_LONG;
-                        bits = (split ? ((UNSAFE.getInt(inputBase, currentAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, currentAddress + 4) << 32)) : UNSAFE.getLong(inputBase, currentAddress));
+                        bits = (split ? ((unsafe.getInt(inputBase, currentAddress) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, currentAddress + 4) << 32)) : unsafe.getLong(inputBase, currentAddress));
                     }
                 }
 
                 int numberOfBits;
 
-                numberOfBits = literalsLengthNumbersOfBits[literalsLengthState];
-                literalsLengthState = (int) (literalsLengthNewStates[literalsLengthState] + (((bits << bitsConsumed) >>> 1) >>> (63 - numberOfBits))); // <= 9 bits
+                numberOfBits = ((int) literalsLengthEntry >>> 16) & 0xFF;
+                literalsLengthState = (literalsLengthEntry & 0xFFFF) + ((((bits << bitsConsumed) >>> 1) >>> (63 - numberOfBits)) << 3); // <= 9 bits
                 bitsConsumed += numberOfBits;
 
-                numberOfBits = matchLengthNumbersOfBits[matchLengthState];
-                matchLengthState = (int) (matchLengthNewStates[matchLengthState] + (((bits << bitsConsumed) >>> 1) >>> (63 - numberOfBits))); // <= 9 bits
+                numberOfBits = ((int) matchLengthEntry >>> 16) & 0xFF;
+                matchLengthState = (matchLengthEntry & 0xFFFF) + ((((bits << bitsConsumed) >>> 1) >>> (63 - numberOfBits)) << 3); // <= 9 bits
                 bitsConsumed += numberOfBits;
 
-                numberOfBits = offsetCodesNumbersOfBits[offsetCodesState];
-                offsetCodesState = (int) (offsetCodesNewStates[offsetCodesState] + (((bits << bitsConsumed) >>> 1) >>> (63 - numberOfBits))); // <= 8 bits
+                numberOfBits = ((int) offsetCodesEntry >>> 16) & 0xFF;
+                offsetCodesState = (offsetCodesEntry & 0xFFFF) + ((((bits << bitsConsumed) >>> 1) >>> (63 - numberOfBits)) << 3); // <= 8 bits
                 bitsConsumed += numberOfBits;
 
-                final long literalOutputLimit = output + literalsLength;
-                final long matchOutputLimit = literalOutputLimit + matchLength;
+            }
+            final long literalOutputLimit = output + literalsLength;
+            final long matchOutputLimit = literalOutputLimit + matchLength;
 
-                if (!(matchOutputLimit <= outputLimit)) {
-                    throw fail(input, "Output buffer too small");
-                }
-                long literalEnd = literalsInput + literalsLength;
-                if (!(literalEnd <= literalsLimit)) {
-                    throw fail(input, "Input is corrupted");
-                }
+            long literalEnd = literalsInput + literalsLength;
+            if (!(literalEnd <= literalsLimit)) {
+                throw fail(input, "Input is corrupted");
+            }
 
-                long matchAddress = literalOutputLimit - offset;
-                if (!(matchAddress >= outputAbsoluteBaseAddress)) {
-                    throw fail(input, "Input is corrupted");
-                }
+            long matchAddress = literalOutputLimit - offset;
+            if (!(matchAddress >= outputAbsoluteBaseAddress)) {
+                throw fail(input, "Input is corrupted");
+            }
 
-                if (literalOutputLimit > fastOutputLimit) {
-                    executeLastSequence(outputBase, output, literalOutputLimit, matchOutputLimit, fastOutputLimit, literalsInput, matchAddress);
+            if (matchOutputLimit <= wildOutputLimit) {
+                // ---- begin inlined literal / match copies (common case) ----
+                // Like native zstd's ZSTD_execSequence: one limit check (matchOutputLimit + 32 <=
+                // outputLimit) covers every over-copy below, so literals of <= 16 bytes and matches of
+                // <= 16 bytes at an offset >= 16 take no further bounds checks and no helper call.
+                // The second literal word is only copied when needed (it costs 2 extra Unsafe
+                // accesses per word on ARM32).
+                {
+                    long v = (split ? ((unsafe.getInt(literalsBase, literalsInput) & 0xFFFFFFFFL) | ((long) unsafe.getInt(literalsBase, literalsInput + 4) << 32)) : unsafe.getLong(literalsBase, literalsInput));
+                    if (split) {
+                        unsafe.putInt(outputBase, output, (int) v);
+                        unsafe.putInt(outputBase, output + 4, (int) (v >>> 32));
+                    }
+                    else {
+                        unsafe.putLong(outputBase, output, v);
+                    }
+                }
+                if (literalsLength > SIZE_OF_LONG) {
+                    {
+                        long v = (split ? ((unsafe.getInt(literalsBase, literalsInput + SIZE_OF_LONG) & 0xFFFFFFFFL) | ((long) unsafe.getInt(literalsBase, literalsInput + SIZE_OF_LONG + 4) << 32)) : unsafe.getLong(literalsBase, literalsInput + SIZE_OF_LONG));
+                        if (split) {
+                            unsafe.putInt(outputBase, output + SIZE_OF_LONG, (int) v);
+                            unsafe.putInt(outputBase, output + SIZE_OF_LONG + 4, (int) (v >>> 32));
+                        }
+                        else {
+                            unsafe.putLong(outputBase, output + SIZE_OF_LONG, v);
+                        }
+                    }
+                    if (literalsLength > 2 * SIZE_OF_LONG) {
+                        copyLiterals(outputBase, literalsBase, output + 2 * SIZE_OF_LONG, literalsInput + 2 * SIZE_OF_LONG, literalOutputLimit);
+                    }
+                }
+                output = literalOutputLimit;
+                if (offset >= 2 * SIZE_OF_LONG) {
+                    {
+                        long v = (split ? ((unsafe.getInt(outputBase, matchAddress) & 0xFFFFFFFFL) | ((long) unsafe.getInt(outputBase, matchAddress + 4) << 32)) : unsafe.getLong(outputBase, matchAddress));
+                        if (split) {
+                            unsafe.putInt(outputBase, output, (int) v);
+                            unsafe.putInt(outputBase, output + 4, (int) (v >>> 32));
+                        }
+                        else {
+                            unsafe.putLong(outputBase, output, v);
+                        }
+                    }
+                    {
+                        long v = (split ? ((unsafe.getInt(outputBase, matchAddress + SIZE_OF_LONG) & 0xFFFFFFFFL) | ((long) unsafe.getInt(outputBase, matchAddress + SIZE_OF_LONG + 4) << 32)) : unsafe.getLong(outputBase, matchAddress + SIZE_OF_LONG));
+                        if (split) {
+                            unsafe.putInt(outputBase, output + SIZE_OF_LONG, (int) v);
+                            unsafe.putInt(outputBase, output + SIZE_OF_LONG + 4, (int) (v >>> 32));
+                        }
+                        else {
+                            unsafe.putLong(outputBase, output + SIZE_OF_LONG, v);
+                        }
+                    }
+                    if (matchLength > 2 * SIZE_OF_LONG) {
+                        copyMatchTail(outputBase, fastOutputLimit, output + 2 * SIZE_OF_LONG, matchOutputLimit, matchAddress + 2 * SIZE_OF_LONG, matchLength - 2 * SIZE_OF_LONG, fastMatchOutputLimit);
+                    }
                 }
                 else {
-                    // copy literals. literalOutputLimit <= fastOutputLimit, so we can copy
-                    // long at a time with over-copy
-                    // ---- begin inlined copyLiterals / copyMatchHead / copyMatchTail (common case) ----
-                    // ARM/ART: the three helpers contain loops and are too big for ART to inline, so
-                    // they were three real calls per sequence. Most sequences have <= 8 literal bytes,
-                    // a match offset >= 8 and a match of <= 16 bytes: those take three 8-byte copies
-                    // here. Anything longer or closer continues in the helpers. Same bytes written.
-                    long literalsValue = (split ? ((UNSAFE.getInt(literalsBase, literalsInput) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(literalsBase, literalsInput + 4) << 32)) : UNSAFE.getLong(literalsBase, literalsInput));
-                    if (split) {
-                        UNSAFE.putInt(outputBase, output, (int) literalsValue);
-                        UNSAFE.putInt(outputBase, output + 4, (int) (literalsValue >>> 32));
-                    }
-                    else {
-                        UNSAFE.putLong(outputBase, output, literalsValue);
-                    }
-                    if (output + SIZE_OF_LONG < literalOutputLimit) {
-                        copyLiterals(outputBase, literalsBase, output + SIZE_OF_LONG, literalsInput + SIZE_OF_LONG, literalOutputLimit);
-                    }
-                    output = literalOutputLimit;
-
-                    long tailAddress;
-                    if (offset >= SIZE_OF_LONG) {
-                        long matchValue = (split ? ((UNSAFE.getInt(outputBase, matchAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(outputBase, matchAddress + 4) << 32)) : UNSAFE.getLong(outputBase, matchAddress));
-                        if (split) {
-                            UNSAFE.putInt(outputBase, output, (int) matchValue);
-                            UNSAFE.putInt(outputBase, output + 4, (int) (matchValue >>> 32));
-                        }
-                        else {
-                            UNSAFE.putLong(outputBase, output, matchValue);
-                        }
-                        tailAddress = matchAddress + SIZE_OF_LONG;
-                    }
-                    else {
-                        tailAddress = copyMatchHead(outputBase, output, offset, matchAddress);
-                    }
-
-                    if (matchLength <= 2 * SIZE_OF_LONG && matchOutputLimit < fastMatchOutputLimit) {
-                        long tailValue = (split ? ((UNSAFE.getInt(outputBase, tailAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(outputBase, tailAddress + 4) << 32)) : UNSAFE.getLong(outputBase, tailAddress));
-                        if (split) {
-                            UNSAFE.putInt(outputBase, output + SIZE_OF_LONG, (int) tailValue);
-                            UNSAFE.putInt(outputBase, output + SIZE_OF_LONG + 4, (int) (tailValue >>> 32));
-                        }
-                        else {
-                            UNSAFE.putLong(outputBase, output + SIZE_OF_LONG, tailValue);
-                        }
-                    }
-                    else {
-                        copyMatchTail(outputBase, fastOutputLimit, output + SIZE_OF_LONG, matchOutputLimit, tailAddress, matchLength - SIZE_OF_LONG, fastMatchOutputLimit);
-                    }
-                    // ---- end inlined copyLiterals / copyMatchHead / copyMatchTail ----
+                    long tailAddress = copyMatchHead(outputBase, output, offset, matchAddress);
+                    copyMatchTail(outputBase, fastOutputLimit, output + SIZE_OF_LONG, matchOutputLimit, tailAddress, matchLength - SIZE_OF_LONG, fastMatchOutputLimit);
                 }
-                output = matchOutputLimit;
-                literalsInput = literalEnd;
+                // ---- end inlined literal / match copies ----
             }
-            previousOffsets[0] = repeatOffset0;
-            previousOffsets[1] = repeatOffset1;
-            previousOffsets[2] = repeatOffset2;
+            else if (!(matchOutputLimit <= outputLimit)) {
+                throw fail(input, "Output buffer too small");
+            }
+            else if (literalOutputLimit > fastOutputLimit) {
+                executeLastSequence(outputBase, output, literalOutputLimit, matchOutputLimit, fastOutputLimit, literalsInput, matchAddress);
+            }
+            else {
+                // copy literals. literalOutputLimit <= fastOutputLimit, so we can copy
+                // long at a time with over-copy
+                // ---- begin inlined copyLiterals / copyMatchHead / copyMatchTail (common case) ----
+                // ARM/ART: the three helpers contain loops and are too big for ART to inline, so
+                // they were three real calls per sequence. Most sequences have <= 8 literal bytes,
+                // a match offset >= 8 and a match of <= 16 bytes: those take three 8-byte copies
+                // here. Anything longer or closer continues in the helpers. Same bytes written.
+                long literalsValue = (split ? ((unsafe.getInt(literalsBase, literalsInput) & 0xFFFFFFFFL) | ((long) unsafe.getInt(literalsBase, literalsInput + 4) << 32)) : unsafe.getLong(literalsBase, literalsInput));
+                if (split) {
+                    unsafe.putInt(outputBase, output, (int) literalsValue);
+                    unsafe.putInt(outputBase, output + 4, (int) (literalsValue >>> 32));
+                }
+                else {
+                    unsafe.putLong(outputBase, output, literalsValue);
+                }
+                if (output + SIZE_OF_LONG < literalOutputLimit) {
+                    copyLiterals(outputBase, literalsBase, output + SIZE_OF_LONG, literalsInput + SIZE_OF_LONG, literalOutputLimit);
+                }
+                output = literalOutputLimit;
+
+                long tailAddress;
+                if (offset >= SIZE_OF_LONG) {
+                    long matchValue = (split ? ((unsafe.getInt(outputBase, matchAddress) & 0xFFFFFFFFL) | ((long) unsafe.getInt(outputBase, matchAddress + 4) << 32)) : unsafe.getLong(outputBase, matchAddress));
+                    if (split) {
+                        unsafe.putInt(outputBase, output, (int) matchValue);
+                        unsafe.putInt(outputBase, output + 4, (int) (matchValue >>> 32));
+                    }
+                    else {
+                        unsafe.putLong(outputBase, output, matchValue);
+                    }
+                    tailAddress = matchAddress + SIZE_OF_LONG;
+                }
+                else {
+                    tailAddress = copyMatchHead(outputBase, output, offset, matchAddress);
+                }
+
+                if (matchLength <= 2 * SIZE_OF_LONG && matchOutputLimit < fastMatchOutputLimit) {
+                    long tailValue = (split ? ((unsafe.getInt(outputBase, tailAddress) & 0xFFFFFFFFL) | ((long) unsafe.getInt(outputBase, tailAddress + 4) << 32)) : unsafe.getLong(outputBase, tailAddress));
+                    if (split) {
+                        unsafe.putInt(outputBase, output + SIZE_OF_LONG, (int) tailValue);
+                        unsafe.putInt(outputBase, output + SIZE_OF_LONG + 4, (int) (tailValue >>> 32));
+                    }
+                    else {
+                        unsafe.putLong(outputBase, output + SIZE_OF_LONG, tailValue);
+                    }
+                }
+                else {
+                    copyMatchTail(outputBase, fastOutputLimit, output + SIZE_OF_LONG, matchOutputLimit, tailAddress, matchLength - SIZE_OF_LONG, fastMatchOutputLimit);
+                }
+                // ---- end inlined copyLiterals / copyMatchHead / copyMatchTail ----
+            }
+            output = matchOutputLimit;
+            literalsInput = literalEnd;
         }
-
-        // last literal segment
-        output = copyLastLiteral(input, literalsBase, literalsInput, literalsLimit, outputBase, output, outputLimit);
-
-        return (int) (output - outputAddress);
+        int[] previousOffsets = this.previousOffsets;
+        previousOffsets[0] = repeatOffset0;
+        previousOffsets[1] = repeatOffset1;
+        previousOffsets[2] = repeatOffset2;
+        remainingLiteralsInput = literalsInput;
+        return output;
     }
 
     private static long copyLastLiteral(long input, Object literalsBase, long literalsInput, long literalsLimit, Object outputBase, long output, long outputLimit)
@@ -661,6 +1397,10 @@ class ZstdFrameDecompressor
 
     private static void copyMatchTail(Object outputBase, long fastOutputLimit, long output, long matchOutputLimit, long matchAddress, int matchLength, long fastMatchOutputLimit)
     {
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
         final boolean split = SPLIT_LONGS;
         // fastMatchOutputLimit is just fastOutputLimit - SIZE_OF_LONG. It needs to be passed in so that it can be computed once for the
         // whole invocation to decompressSequences. Otherwise, we'd just compute it here.
@@ -670,12 +1410,12 @@ class ZstdFrameDecompressor
             int copied = 0;
             do {
                 if (split) {
-                    long splitValue = ((UNSAFE.getInt(outputBase, matchAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(outputBase, matchAddress + 4) << 32));
-                    UNSAFE.putInt(outputBase, output, (int) splitValue);
-                    UNSAFE.putInt(outputBase, output + 4, (int) (splitValue >>> 32));
+                    long splitValue = ((unsafe.getInt(outputBase, matchAddress) & 0xFFFFFFFFL) | ((long) unsafe.getInt(outputBase, matchAddress + 4) << 32));
+                    unsafe.putInt(outputBase, output, (int) splitValue);
+                    unsafe.putInt(outputBase, output + 4, (int) (splitValue >>> 32));
                 }
                 else {
-                    UNSAFE.putLong(outputBase, output, UNSAFE.getLong(outputBase, matchAddress));
+                    unsafe.putLong(outputBase, output, unsafe.getLong(outputBase, matchAddress));
                 }
                 output += SIZE_OF_LONG;
                 matchAddress += SIZE_OF_LONG;
@@ -686,25 +1426,29 @@ class ZstdFrameDecompressor
         else {
             while (output < fastOutputLimit) {
                 if (split) {
-                    long splitValue = ((UNSAFE.getInt(outputBase, matchAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(outputBase, matchAddress + 4) << 32));
-                    UNSAFE.putInt(outputBase, output, (int) splitValue);
-                    UNSAFE.putInt(outputBase, output + 4, (int) (splitValue >>> 32));
+                    long splitValue = ((unsafe.getInt(outputBase, matchAddress) & 0xFFFFFFFFL) | ((long) unsafe.getInt(outputBase, matchAddress + 4) << 32));
+                    unsafe.putInt(outputBase, output, (int) splitValue);
+                    unsafe.putInt(outputBase, output + 4, (int) (splitValue >>> 32));
                 }
                 else {
-                    UNSAFE.putLong(outputBase, output, UNSAFE.getLong(outputBase, matchAddress));
+                    unsafe.putLong(outputBase, output, unsafe.getLong(outputBase, matchAddress));
                 }
                 matchAddress += SIZE_OF_LONG;
                 output += SIZE_OF_LONG;
             }
 
             while (output < matchOutputLimit) {
-                UNSAFE.putByte(outputBase, output++, UNSAFE.getByte(outputBase, matchAddress++));
+                unsafe.putByte(outputBase, output++, unsafe.getByte(outputBase, matchAddress++));
             }
         }
     }
 
     private static long copyMatchHead(Object outputBase, long output, int offset, long matchAddress)
     {
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
         final boolean split = SPLIT_LONGS;
         // copy match
         if (offset < 8) {
@@ -713,7 +1457,7 @@ class ZstdFrameDecompressor
             // register and write it once, instead of 4 getByte/putByte pairs (JNI calls on ART
             // builds that don't intrinsify them). Reading 8 bytes at matchAddress stays below
             // output + 8, which the caller guarantees is writable.
-            long pattern = (split ? ((UNSAFE.getInt(outputBase, matchAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(outputBase, matchAddress + 4) << 32)) : UNSAFE.getLong(outputBase, matchAddress));
+            long pattern = (split ? ((unsafe.getInt(outputBase, matchAddress) & 0xFFFFFFFFL) | ((long) unsafe.getInt(outputBase, matchAddress + 4) << 32)) : unsafe.getLong(outputBase, matchAddress));
             int period = offset * Byte.SIZE;
             pattern &= (1L << period) - 1;
             pattern |= pattern << period;              // 2 * offset bytes: enough for offset >= 4
@@ -724,22 +1468,22 @@ class ZstdFrameDecompressor
                 }
             }
             if (split) {
-                UNSAFE.putInt(outputBase, output, (int) pattern);
-                UNSAFE.putInt(outputBase, output + 4, (int) (pattern >>> 32));
+                unsafe.putInt(outputBase, output, (int) pattern);
+                unsafe.putInt(outputBase, output + 4, (int) (pattern >>> 32));
             }
             else {
-                UNSAFE.putLong(outputBase, output, pattern);
+                unsafe.putLong(outputBase, output, pattern);
             }
             matchAddress += DEC_32_TABLE[offset] - DEC_64_TABLE[offset];
         }
         else {
             if (split) {
-                long splitValue = ((UNSAFE.getInt(outputBase, matchAddress) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(outputBase, matchAddress + 4) << 32));
-                UNSAFE.putInt(outputBase, output, (int) splitValue);
-                UNSAFE.putInt(outputBase, output + 4, (int) (splitValue >>> 32));
+                long splitValue = ((unsafe.getInt(outputBase, matchAddress) & 0xFFFFFFFFL) | ((long) unsafe.getInt(outputBase, matchAddress + 4) << 32));
+                unsafe.putInt(outputBase, output, (int) splitValue);
+                unsafe.putInt(outputBase, output + 4, (int) (splitValue >>> 32));
             }
             else {
-                UNSAFE.putLong(outputBase, output, UNSAFE.getLong(outputBase, matchAddress));
+                unsafe.putLong(outputBase, output, unsafe.getLong(outputBase, matchAddress));
             }
             matchAddress += SIZE_OF_LONG;
         }
@@ -748,16 +1492,20 @@ class ZstdFrameDecompressor
 
     private static long copyLiterals(Object outputBase, Object literalsBase, long output, long literalsInput, long literalOutputLimit)
     {
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
         final boolean split = SPLIT_LONGS;
         long literalInput = literalsInput;
         do {
             if (split) {
-                long splitValue = ((UNSAFE.getInt(literalsBase, literalInput) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(literalsBase, literalInput + 4) << 32));
-                UNSAFE.putInt(outputBase, output, (int) splitValue);
-                UNSAFE.putInt(outputBase, output + 4, (int) (splitValue >>> 32));
+                long splitValue = ((unsafe.getInt(literalsBase, literalInput) & 0xFFFFFFFFL) | ((long) unsafe.getInt(literalsBase, literalInput + 4) << 32));
+                unsafe.putInt(outputBase, output, (int) splitValue);
+                unsafe.putInt(outputBase, output + 4, (int) (splitValue >>> 32));
             }
             else {
-                UNSAFE.putLong(outputBase, output, UNSAFE.getLong(literalsBase, literalInput));
+                unsafe.putLong(outputBase, output, unsafe.getLong(literalsBase, literalInput));
             }
             output += SIZE_OF_LONG;
             literalInput += SIZE_OF_LONG;
@@ -769,25 +1517,34 @@ class ZstdFrameDecompressor
 
     private long computeMatchLengthTable(int matchLengthType, Object inputBase, long input, long inputLimit)
     {
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
         switch (matchLengthType) {
             case SEQUENCE_ENCODING_RLE:
                 verify(input < inputLimit, input, "Not enough input bytes");
 
-                byte value = UNSAFE.getByte(inputBase, input++);
+                byte value = unsafe.getByte(inputBase, input++);
                 verify(value <= MAX_MATCH_LENGTH_SYMBOL, input, "Value exceeds expected maximum value");
 
                 FseTableReader.initializeRleTable(matchLengthTable, value);
                 currentMatchLengthTable = matchLengthTable;
+                currentMatchLengthPacked = pack(matchLengthTable, MATCH_LENGTH_BASE, MATCH_LENGTH_BITS, matchLengthPacked);
+                place(sequenceTables, currentMatchLengthPacked, 0, MATCH_LENGTH_TABLE_START);
                 break;
             case SEQUENCE_ENCODING_BASIC:
                 currentMatchLengthTable = DEFAULT_MATCH_LENGTH_TABLE;
+                currentMatchLengthPacked = DEFAULT_MATCH_LENGTH_PACKED;
+                place(sequenceTables, currentMatchLengthPacked, DEFAULT_MATCH_LENGTH_TABLE.log2Size, MATCH_LENGTH_TABLE_START);
                 break;
             case SEQUENCE_ENCODING_REPEAT:
                 verify(currentMatchLengthTable != null, input, "Expected match length table to be present");
                 break;
             case SEQUENCE_ENCODING_COMPRESSED:
-                input += fse.readFseTable(matchLengthTable, inputBase, input, inputLimit, MAX_MATCH_LENGTH_SYMBOL, MATCH_LENGTH_TABLE_LOG);
+                input += fse.readFseTable(matchLengthTable, sequenceTables, MATCH_LENGTH_TABLE_START, MATCH_LENGTH_BASE, MATCH_LENGTH_BITS, inputBase, input, inputLimit, MAX_MATCH_LENGTH_SYMBOL, MATCH_LENGTH_TABLE_LOG);
                 currentMatchLengthTable = matchLengthTable;
+                currentMatchLengthPacked = matchLengthPacked;
                 break;
             default:
                 throw fail(input, "Invalid match length encoding type");
@@ -797,25 +1554,34 @@ class ZstdFrameDecompressor
 
     private long computeOffsetsTable(int offsetCodesType, Object inputBase, long input, long inputLimit)
     {
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
         switch (offsetCodesType) {
             case SEQUENCE_ENCODING_RLE:
                 verify(input < inputLimit, input, "Not enough input bytes");
 
-                byte value = UNSAFE.getByte(inputBase, input++);
+                byte value = unsafe.getByte(inputBase, input++);
                 verify(value <= DEFAULT_MAX_OFFSET_CODE_SYMBOL, input, "Value exceeds expected maximum value");
 
                 FseTableReader.initializeRleTable(offsetCodesTable, value);
                 currentOffsetCodesTable = offsetCodesTable;
+                currentOffsetCodesPacked = pack(offsetCodesTable, OFFSET_CODES_BASE, null, offsetCodesPacked);
+                place(sequenceTables, currentOffsetCodesPacked, 0, OFFSET_CODES_TABLE_START);
                 break;
             case SEQUENCE_ENCODING_BASIC:
                 currentOffsetCodesTable = DEFAULT_OFFSET_CODES_TABLE;
+                currentOffsetCodesPacked = DEFAULT_OFFSET_CODES_PACKED;
+                place(sequenceTables, currentOffsetCodesPacked, DEFAULT_OFFSET_CODES_TABLE.log2Size, OFFSET_CODES_TABLE_START);
                 break;
             case SEQUENCE_ENCODING_REPEAT:
                 verify(currentOffsetCodesTable != null, input, "Expected match length table to be present");
                 break;
             case SEQUENCE_ENCODING_COMPRESSED:
-                input += fse.readFseTable(offsetCodesTable, inputBase, input, inputLimit, DEFAULT_MAX_OFFSET_CODE_SYMBOL, OFFSET_TABLE_LOG);
+                input += fse.readFseTable(offsetCodesTable, sequenceTables, OFFSET_CODES_TABLE_START, OFFSET_CODES_BASE, OFFSET_CODES_BITS, inputBase, input, inputLimit, DEFAULT_MAX_OFFSET_CODE_SYMBOL, OFFSET_TABLE_LOG);
                 currentOffsetCodesTable = offsetCodesTable;
+                currentOffsetCodesPacked = offsetCodesPacked;
                 break;
             default:
                 throw fail(input, "Invalid offset code encoding type");
@@ -825,25 +1591,34 @@ class ZstdFrameDecompressor
 
     private long computeLiteralsTable(int literalsLengthType, Object inputBase, long input, long inputLimit)
     {
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
         switch (literalsLengthType) {
             case SEQUENCE_ENCODING_RLE:
                 verify(input < inputLimit, input, "Not enough input bytes");
 
-                byte value = UNSAFE.getByte(inputBase, input++);
+                byte value = unsafe.getByte(inputBase, input++);
                 verify(value <= MAX_LITERALS_LENGTH_SYMBOL, input, "Value exceeds expected maximum value");
 
                 FseTableReader.initializeRleTable(literalsLengthTable, value);
                 currentLiteralsLengthTable = literalsLengthTable;
+                currentLiteralsLengthPacked = pack(literalsLengthTable, LITERALS_LENGTH_BASE, LITERALS_LENGTH_BITS, literalsLengthPacked);
+                place(sequenceTables, currentLiteralsLengthPacked, 0, LITERALS_LENGTH_TABLE_START);
                 break;
             case SEQUENCE_ENCODING_BASIC:
                 currentLiteralsLengthTable = DEFAULT_LITERALS_LENGTH_TABLE;
+                currentLiteralsLengthPacked = DEFAULT_LITERALS_LENGTH_PACKED;
+                place(sequenceTables, currentLiteralsLengthPacked, DEFAULT_LITERALS_LENGTH_TABLE.log2Size, LITERALS_LENGTH_TABLE_START);
                 break;
             case SEQUENCE_ENCODING_REPEAT:
                 verify(currentLiteralsLengthTable != null, input, "Expected match length table to be present");
                 break;
             case SEQUENCE_ENCODING_COMPRESSED:
-                input += fse.readFseTable(literalsLengthTable, inputBase, input, inputLimit, MAX_LITERALS_LENGTH_SYMBOL, LITERAL_LENGTH_TABLE_LOG);
+                input += fse.readFseTable(literalsLengthTable, sequenceTables, LITERALS_LENGTH_TABLE_START, LITERALS_LENGTH_BASE, LITERALS_LENGTH_BITS, inputBase, input, inputLimit, MAX_LITERALS_LENGTH_SYMBOL, LITERAL_LENGTH_TABLE_LOG);
                 currentLiteralsLengthTable = literalsLengthTable;
+                currentLiteralsLengthPacked = literalsLengthPacked;
                 break;
             default:
                 throw fail(input, "Invalid literals length encoding type");
@@ -853,18 +1628,22 @@ class ZstdFrameDecompressor
 
     private void executeLastSequence(Object outputBase, long output, long literalOutputLimit, long matchOutputLimit, long fastOutputLimit, long literalInput, long matchAddress)
     {
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
         final boolean split = SPLIT_LONGS;
         // copy literals
         if (output < fastOutputLimit) {
             // wild copy
             do {
                 if (split) {
-                    long splitValue = ((UNSAFE.getInt(literalsBase, literalInput) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(literalsBase, literalInput + 4) << 32));
-                    UNSAFE.putInt(outputBase, output, (int) splitValue);
-                    UNSAFE.putInt(outputBase, output + 4, (int) (splitValue >>> 32));
+                    long splitValue = ((unsafe.getInt(literalsBase, literalInput) & 0xFFFFFFFFL) | ((long) unsafe.getInt(literalsBase, literalInput + 4) << 32));
+                    unsafe.putInt(outputBase, output, (int) splitValue);
+                    unsafe.putInt(outputBase, output + 4, (int) (splitValue >>> 32));
                 }
                 else {
-                    UNSAFE.putLong(outputBase, output, UNSAFE.getLong(literalsBase, literalInput));
+                    unsafe.putLong(outputBase, output, unsafe.getLong(literalsBase, literalInput));
                 }
                 output += SIZE_OF_LONG;
                 literalInput += SIZE_OF_LONG;
@@ -876,14 +1655,14 @@ class ZstdFrameDecompressor
         }
 
         while (output < literalOutputLimit) {
-            UNSAFE.putByte(outputBase, output, UNSAFE.getByte(literalsBase, literalInput));
+            unsafe.putByte(outputBase, output, unsafe.getByte(literalsBase, literalInput));
             output++;
             literalInput++;
         }
 
         // copy match
         while (output < matchOutputLimit) {
-            UNSAFE.putByte(outputBase, output, UNSAFE.getByte(outputBase, matchAddress));
+            unsafe.putByte(outputBase, output, unsafe.getByte(outputBase, matchAddress));
             output++;
             matchAddress++;
         }
@@ -891,6 +1670,10 @@ class ZstdFrameDecompressor
 
     private int decodeCompressedLiterals(Object inputBase, final long inputAddress, int blockSize, int literalsBlockType)
     {
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
         long input = inputAddress;
         verify(blockSize >= 5, input, "Not enough input bytes");
 
@@ -899,12 +1682,12 @@ class ZstdFrameDecompressor
         int uncompressedSize;
         boolean singleStream = false;
         int headerSize;
-        int type = (UNSAFE.getByte(inputBase, input) >> 2) & 0b11;
+        int type = (unsafe.getByte(inputBase, input) >> 2) & 0b11;
         switch (type) {
             case 0:
                 singleStream = true;
             case 1: {
-                int header = UNSAFE.getInt(inputBase, input);
+                int header = unsafe.getInt(inputBase, input);
 
                 headerSize = 3;
                 uncompressedSize = (header >>> 4) & mask(10);
@@ -912,7 +1695,7 @@ class ZstdFrameDecompressor
                 break;
             }
             case 2: {
-                int header = UNSAFE.getInt(inputBase, input);
+                int header = unsafe.getInt(inputBase, input);
 
                 headerSize = 4;
                 uncompressedSize = (header >>> 4) & mask(14);
@@ -921,8 +1704,8 @@ class ZstdFrameDecompressor
             }
             case 3: {
                 // read 5 little-endian bytes
-                long header = UNSAFE.getByte(inputBase, input) & 0xFF |
-                        (UNSAFE.getInt(inputBase, input + 1) & 0xFFFF_FFFFL) << 8;
+                long header = unsafe.getByte(inputBase, input) & 0xFF |
+                        (unsafe.getInt(inputBase, input + 1) & 0xFFFF_FFFFL) << 8;
 
                 headerSize = 5;
                 uncompressedSize = (int) ((header >>> 4) & mask(18));
@@ -959,24 +1742,28 @@ class ZstdFrameDecompressor
 
     private int decodeRleLiterals(Object inputBase, final long inputAddress, int blockSize)
     {
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
         long input = inputAddress;
         int outputSize;
 
-        int type = (UNSAFE.getByte(inputBase, input) >> 2) & 0b11;
+        int type = (unsafe.getByte(inputBase, input) >> 2) & 0b11;
         switch (type) {
             case 0:
             case 2:
-                outputSize = (UNSAFE.getByte(inputBase, input) & 0xFF) >>> 3;
+                outputSize = (unsafe.getByte(inputBase, input) & 0xFF) >>> 3;
                 input++;
                 break;
             case 1:
-                outputSize = (UNSAFE.getShort(inputBase, input) & 0xFFFF) >>> 4;
+                outputSize = (unsafe.getShort(inputBase, input) & 0xFFFF) >>> 4;
                 input += 2;
                 break;
             case 3:
                 // we need at least 4 bytes (3 for the header, 1 for the payload)
                 verify(blockSize >= SIZE_OF_INT, input, "Not enough input bytes");
-                outputSize = (UNSAFE.getInt(inputBase, input) & 0xFF_FFFF) >>> 4;
+                outputSize = (unsafe.getInt(inputBase, input) & 0xFF_FFFF) >>> 4;
                 input += 3;
                 break;
             default:
@@ -985,8 +1772,8 @@ class ZstdFrameDecompressor
 
         verify(outputSize <= MAX_BLOCK_SIZE, input, "Output exceeds maximum block size");
 
-        byte value = UNSAFE.getByte(inputBase, input++);
-        Arrays.fill(literals, 0, outputSize + SIZE_OF_LONG, value);
+        byte value = unsafe.getByte(inputBase, input++);
+        Arrays.fill(literals, 0, outputSize + 2 * SIZE_OF_LONG, value);
 
         literalsBase = literals;
         literalsAddress = ARRAY_BYTE_BASE_OFFSET;
@@ -997,24 +1784,28 @@ class ZstdFrameDecompressor
 
     private int decodeRawLiterals(Object inputBase, final long inputAddress, long inputLimit)
     {
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
         long input = inputAddress;
-        int type = (UNSAFE.getByte(inputBase, input) >> 2) & 0b11;
+        int type = (unsafe.getByte(inputBase, input) >> 2) & 0b11;
 
         int literalSize;
         switch (type) {
             case 0:
             case 2:
-                literalSize = (UNSAFE.getByte(inputBase, input) & 0xFF) >>> 3;
+                literalSize = (unsafe.getByte(inputBase, input) & 0xFF) >>> 3;
                 input++;
                 break;
             case 1:
-                literalSize = (UNSAFE.getShort(inputBase, input) & 0xFFFF) >>> 4;
+                literalSize = (unsafe.getShort(inputBase, input) & 0xFFFF) >>> 4;
                 input += 2;
                 break;
             case 3:
                 // read 3 little-endian bytes
-                int header = ((UNSAFE.getByte(inputBase, input) & 0xFF) |
-                        ((UNSAFE.getShort(inputBase, input + 1) & 0xFFFF) << 8));
+                int header = ((unsafe.getByte(inputBase, input) & 0xFF) |
+                        ((unsafe.getShort(inputBase, input + 1) & 0xFFFF) << 8));
 
                 literalSize = header >>> 4;
                 input += 3;
@@ -1027,13 +1818,16 @@ class ZstdFrameDecompressor
 
         // Set literals pointer to [input, literalSize], but only if we can copy 8 bytes at a time during sequence decoding
         // Otherwise, copy literals into buffer that's big enough to guarantee that
-        if (literalSize > (inputLimit - input) - SIZE_OF_LONG) {
+        // A block without sequences (sequence count byte 0 right after the literals) only copies its
+        // literals out exactly (copyLastLiteral): they need no slack, so they are never copied twice.
+        boolean literalsOnly = input + literalSize < inputLimit && unsafe.getByte(inputBase, input + literalSize) == 0;
+        if (literalSize > (inputLimit - input) - 2 * SIZE_OF_LONG && !literalsOnly) {
             literalsBase = literals;
             literalsAddress = ARRAY_BYTE_BASE_OFFSET;
             literalsLimit = ARRAY_BYTE_BASE_OFFSET + literalSize;
 
             copyMemory(inputBase, input, literals, literalsAddress, literalSize);
-            Arrays.fill(literals, literalSize, literalSize + SIZE_OF_LONG, (byte) 0);
+            Arrays.fill(literals, literalSize, literalSize + 2 * SIZE_OF_LONG, (byte) 0);
         }
         else {
             literalsBase = inputBase;
@@ -1047,11 +1841,15 @@ class ZstdFrameDecompressor
 
     static FrameHeader readFrameHeader(final Object inputBase, final long inputAddress, final long inputLimit)
     {
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
         final boolean split = SPLIT_LONGS;
         long input = inputAddress;
         verify(input < inputLimit, input, "Not enough input bytes");
 
-        int frameHeaderDescriptor = UNSAFE.getByte(inputBase, input++) & 0xFF;
+        int frameHeaderDescriptor = unsafe.getByte(inputBase, input++) & 0xFF;
         boolean singleSegment = (frameHeaderDescriptor & 0b100000) != 0;
         int dictionaryDescriptor = frameHeaderDescriptor & 0b11;
         int contentSizeDescriptor = frameHeaderDescriptor >>> 6;
@@ -1066,7 +1864,7 @@ class ZstdFrameDecompressor
         // decode window size
         int windowSize = -1;
         if (!singleSegment) {
-            int windowDescriptor = UNSAFE.getByte(inputBase, input++) & 0xFF;
+            int windowDescriptor = unsafe.getByte(inputBase, input++) & 0xFF;
             int exponent = windowDescriptor >>> 3;
             int mantissa = windowDescriptor & 0b111;
 
@@ -1078,15 +1876,15 @@ class ZstdFrameDecompressor
         long dictionaryId = -1;
         switch (dictionaryDescriptor) {
             case 1:
-                dictionaryId = UNSAFE.getByte(inputBase, input) & 0xFF;
+                dictionaryId = unsafe.getByte(inputBase, input) & 0xFF;
                 input += SIZE_OF_BYTE;
                 break;
             case 2:
-                dictionaryId = UNSAFE.getShort(inputBase, input) & 0xFFFF;
+                dictionaryId = unsafe.getShort(inputBase, input) & 0xFFFF;
                 input += SIZE_OF_SHORT;
                 break;
             case 3:
-                dictionaryId = UNSAFE.getInt(inputBase, input) & 0xFFFF_FFFFL;
+                dictionaryId = unsafe.getInt(inputBase, input) & 0xFFFF_FFFFL;
                 input += SIZE_OF_INT;
                 break;
         }
@@ -1097,21 +1895,21 @@ class ZstdFrameDecompressor
         switch (contentSizeDescriptor) {
             case 0:
                 if (singleSegment) {
-                    contentSize = UNSAFE.getByte(inputBase, input) & 0xFF;
+                    contentSize = unsafe.getByte(inputBase, input) & 0xFF;
                     input += SIZE_OF_BYTE;
                 }
                 break;
             case 1:
-                contentSize = UNSAFE.getShort(inputBase, input) & 0xFFFF;
+                contentSize = unsafe.getShort(inputBase, input) & 0xFFFF;
                 contentSize += 256;
                 input += SIZE_OF_SHORT;
                 break;
             case 2:
-                contentSize = UNSAFE.getInt(inputBase, input) & 0xFFFF_FFFFL;
+                contentSize = unsafe.getInt(inputBase, input) & 0xFFFF_FFFFL;
                 input += SIZE_OF_INT;
                 break;
             case 3:
-                contentSize = (split ? ((UNSAFE.getInt(inputBase, input) & 0xFFFFFFFFL) | ((long) UNSAFE.getInt(inputBase, input + 4) << 32)) : UNSAFE.getLong(inputBase, input));
+                contentSize = (split ? ((unsafe.getInt(inputBase, input) & 0xFFFFFFFFL) | ((long) unsafe.getInt(inputBase, input + 4) << 32)) : unsafe.getLong(inputBase, input));
                 input += SIZE_OF_LONG;
                 break;
         }
@@ -1135,9 +1933,13 @@ class ZstdFrameDecompressor
 
     static int verifyMagic(Object inputBase, long inputAddress, long inputLimit)
     {
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
         verify(inputLimit - inputAddress >= 4, inputAddress, "Not enough input bytes");
 
-        int magic = UNSAFE.getInt(inputBase, inputAddress);
+        int magic = unsafe.getInt(inputBase, inputAddress);
         if (magic != MAGIC_NUMBER) {
             if (magic == V07_MAGIC_NUMBER) {
                 throw new MalformedInputException(inputAddress, "Data encoded in unsupported ZSTD v0.7 format");
