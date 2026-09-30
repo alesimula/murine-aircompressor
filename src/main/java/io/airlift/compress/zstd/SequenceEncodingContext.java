@@ -26,6 +26,10 @@ class SequenceEncodingContext
     public final FseCompressionTable matchLengthTable = new FseCompressionTable(Constants.MATCH_LENGTH_TABLE_LOG, MAX_MATCH_LENGTH_SYMBOL);
 
     public final int[] counts = new int[MAX_SEQUENCES + 1];
+    // per-code histograms, filled by SequenceStore.generateCodes
+    public final int[] literalLengthCounts = new int[MAX_LITERALS_LENGTH_SYMBOL + 1];
+    public final int[] offsetCounts = new int[MAX_OFFSET_CODE_SYMBOL + 1];
+    public final int[] matchLengthCounts = new int[MAX_MATCH_LENGTH_SYMBOL + 1];
     public final int[] histogramLanes = new int[Histogram.LANES_SIZE];
     public final short[] normalizedCounts = new short[MAX_SEQUENCES + 1];
 }

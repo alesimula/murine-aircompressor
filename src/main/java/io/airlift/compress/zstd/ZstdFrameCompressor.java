@@ -13,6 +13,8 @@
  */
 package io.airlift.compress.zstd;
 
+import sun.misc.Unsafe;
+
 import static io.airlift.compress.UnsafeUtil.ARRAY_BYTE_BASE_OFFSET;
 import static io.airlift.compress.UnsafeUtil.UNSAFE;
 import static io.airlift.compress.UnsafeUtil.copyMemory;
@@ -51,15 +53,23 @@ class ZstdFrameCompressor
     // visible for testing
     static int writeMagic(final Object outputBase, final long outputAddress, final long outputLimit)
     {
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
         checkArgument(outputLimit - outputAddress >= SIZE_OF_INT, "Output buffer too small");
 
-        UNSAFE.putInt(outputBase, outputAddress, MAGIC_NUMBER);
+        unsafe.putInt(outputBase, outputAddress, MAGIC_NUMBER);
         return SIZE_OF_INT;
     }
 
     // visible for testing
     static int writeFrameHeader(final Object outputBase, final long outputAddress, final long outputLimit, int inputSize, int windowSize)
     {
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
         checkArgument(outputLimit - outputAddress >= MAX_FRAME_HEADER_SIZE, "Output buffer too small");
 
         long output = outputAddress;
@@ -75,7 +85,7 @@ class ZstdFrameCompressor
             frameHeaderDescriptor |= SINGLE_SEGMENT_FLAG;
         }
 
-        UNSAFE.putByte(outputBase, output, (byte) frameHeaderDescriptor);
+        unsafe.putByte(outputBase, output, (byte) frameHeaderDescriptor);
         output++;
 
         if (!singleSegment) {
@@ -95,22 +105,22 @@ class ZstdFrameCompressor
             int mantissa = remainder / (base / 8);
             int encoded = ((exponent - MIN_WINDOW_LOG) << 3) | mantissa;
 
-            UNSAFE.putByte(outputBase, output, (byte) encoded);
+            unsafe.putByte(outputBase, output, (byte) encoded);
             output++;
         }
 
         switch (contentSizeDescriptor) {
             case 0:
                 if (singleSegment) {
-                    UNSAFE.putByte(outputBase, output++, (byte) inputSize);
+                    unsafe.putByte(outputBase, output++, (byte) inputSize);
                 }
                 break;
             case 1:
-                UNSAFE.putShort(outputBase, output, (short) (inputSize - 256));
+                unsafe.putShort(outputBase, output, (short) (inputSize - 256));
                 output += SIZE_OF_SHORT;
                 break;
             case 2:
-                UNSAFE.putInt(outputBase, output, inputSize);
+                unsafe.putInt(outputBase, output, inputSize);
                 output += SIZE_OF_INT;
                 break;
             default:
@@ -123,19 +133,27 @@ class ZstdFrameCompressor
     // visible for testing
     static int writeChecksum(Object outputBase, long outputAddress, long outputLimit, Object inputBase, long inputAddress, long inputLimit)
     {
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
         checkArgument(outputLimit - outputAddress >= SIZE_OF_INT, "Output buffer too small");
 
         int inputSize = (int) (inputLimit - inputAddress);
 
         long hash = XxHash64.hash(0, inputBase, inputAddress, inputSize);
 
-        UNSAFE.putInt(outputBase, outputAddress, (int) hash);
+        unsafe.putInt(outputBase, outputAddress, (int) hash);
 
         return SIZE_OF_INT;
     }
 
     public static int compress(Object inputBase, long inputAddress, long inputLimit, Object outputBase, long outputAddress, long outputLimit, int compressionLevel)
     {
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
         int inputSize = (int) (inputLimit - inputAddress);
 
         CompressionParameters parameters = CompressionParameters.compute(compressionLevel, inputSize);
@@ -144,13 +162,18 @@ class ZstdFrameCompressor
 
         output += writeMagic(outputBase, output, outputLimit);
         output += writeFrameHeader(outputBase, output, outputLimit, inputSize, parameters.getWindowSize());
-        output += compressFrame(inputBase, inputAddress, inputLimit, outputBase, output, outputLimit, parameters);
-        output += writeChecksum(outputBase, output, outputLimit, inputBase, inputAddress, inputLimit);
+        // checksum per block while the block is still in cache, like native zstd (one pass over the
+        // whole input at the end read it back from memory)
+        XxHash64 hasher = new XxHash64();
+        output += compressFrame(inputBase, inputAddress, inputLimit, outputBase, output, outputLimit, parameters, hasher);
+        checkArgument(outputLimit - output >= SIZE_OF_INT, "Output buffer too small");
+        unsafe.putInt(outputBase, output, (int) hasher.hash());
+        output += SIZE_OF_INT;
 
         return (int) (output - outputAddress);
     }
 
-    private static int compressFrame(Object inputBase, long inputAddress, long inputLimit, Object outputBase, long outputAddress, long outputLimit, CompressionParameters parameters)
+    private static int compressFrame(Object inputBase, long inputAddress, long inputLimit, Object outputBase, long outputAddress, long outputLimit, CompressionParameters parameters, XxHash64 hasher)
     {
         int blockSize = parameters.getBlockSize();
 
@@ -160,13 +183,14 @@ class ZstdFrameCompressor
         long output = outputAddress;
         long input = inputAddress;
 
-        CompressionContext context = new CompressionContext(parameters, inputAddress, remaining);
+        CompressionContext context = CompressionContext.acquire(parameters, inputAddress, remaining);
         do {
             checkArgument(outputSize >= SIZE_OF_BLOCK_HEADER + MIN_BLOCK_SIZE, "Output buffer too small");
 
             boolean lastBlock = blockSize >= remaining;
             blockSize = Math.min(blockSize, remaining);
 
+            hasher.update(inputBase, input, blockSize);
             int compressedSize = writeCompressedBlock(inputBase, input, blockSize, outputBase, output, outputSize, context, lastBlock);
 
             input += blockSize;
@@ -176,6 +200,7 @@ class ZstdFrameCompressor
         }
         while (remaining > 0);
 
+        context.release();
         return (int) (output - outputAddress);
     }
 
@@ -225,7 +250,8 @@ class ZstdFrameCompressor
         context.sequenceStore.appendLiterals(inputBase, lastLiteralsAddress, lastLiteralsSize);
 
         // convert length/offsets into codes
-        context.sequenceStore.generateCodes();
+        SequenceEncodingContext sequenceEncodingContext = context.sequenceEncodingContext;
+        context.sequenceStore.generateCodes(sequenceEncodingContext.literalLengthCounts, sequenceEncodingContext.offsetCounts, sequenceEncodingContext.matchLengthCounts);
 
         long outputLimit = outputAddress + outputSize;
         long output = outputAddress;
@@ -269,6 +295,10 @@ class ZstdFrameCompressor
             byte[] literals,
             int literalsSize)
     {
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
         // TODO: move this to Strategy
         boolean bypassCompression = (parameters.getStrategy() == CompressionParameters.Strategy.FAST) && (parameters.getTargetLength() > 0);
         if (bypassCompression || literalsSize <= MINIMUM_LITERALS_SIZE) {
@@ -365,13 +395,13 @@ class ZstdFrameCompressor
             }
             case 4: { // 2 - 2 - 14 - 14
                 int header = encodingType | (2 << 2) | (literalsSize << 4) | (totalSize << 18);
-                UNSAFE.putInt(outputBase, outputAddress, header);
+                unsafe.putInt(outputBase, outputAddress, header);
                 break;
             }
             case 5: { // 2 - 2 - 18 - 18
                 int header = encodingType | (3 << 2) | (literalsSize << 4) | (totalSize << 22);
-                UNSAFE.putInt(outputBase, outputAddress, header);
-                UNSAFE.putByte(outputBase, outputAddress + SIZE_OF_INT, (byte) (totalSize >>> 10));
+                unsafe.putInt(outputBase, outputAddress, header);
+                unsafe.putByte(outputBase, outputAddress + SIZE_OF_INT, (byte) (totalSize >>> 10));
                 break;
             }
             default:  // not possible : headerSize is {3,4,5}
@@ -383,23 +413,27 @@ class ZstdFrameCompressor
 
     private static int rleLiterals(Object outputBase, long outputAddress, int outputSize, Object inputBase, long inputAddress, int inputSize)
     {
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
         int headerSize = 1 + (inputSize > 31 ? 1 : 0) + (inputSize > 4095 ? 1 : 0);
 
         switch (headerSize) {
             case 1: // 2 - 1 - 5
-                UNSAFE.putByte(outputBase, outputAddress, (byte) (RLE_LITERALS_BLOCK | (inputSize << 3)));
+                unsafe.putByte(outputBase, outputAddress, (byte) (RLE_LITERALS_BLOCK | (inputSize << 3)));
                 break;
             case 2: // 2 - 2 - 12
-                UNSAFE.putShort(outputBase, outputAddress, (short) (RLE_LITERALS_BLOCK | (1 << 2) | (inputSize << 4)));
+                unsafe.putShort(outputBase, outputAddress, (short) (RLE_LITERALS_BLOCK | (1 << 2) | (inputSize << 4)));
                 break;
             case 3: // 2 - 2 - 20
-                UNSAFE.putInt(outputBase, outputAddress, RLE_LITERALS_BLOCK | 3 << 2 | inputSize << 4);
+                unsafe.putInt(outputBase, outputAddress, RLE_LITERALS_BLOCK | 3 << 2 | inputSize << 4);
                 break;
             default:   // impossible. headerSize is {1,2,3}
                 throw new IllegalStateException();
         }
 
-        UNSAFE.putByte(outputBase, outputAddress + headerSize, UNSAFE.getByte(inputBase, inputAddress));
+        unsafe.putByte(outputBase, outputAddress + headerSize, unsafe.getByte(inputBase, inputAddress));
 
         return headerSize + 1;
     }
@@ -413,6 +447,10 @@ class ZstdFrameCompressor
 
     private static int rawLiterals(Object outputBase, long outputAddress, int outputSize, Object inputBase, long inputAddress, int inputSize)
     {
+        // ARM/ART: static fields in locals - AOT-compiled code (dex2oat) reloads a static final
+        // (with class-init, read-barrier and null checks) at every use, since Unsafe calls
+        // count as writing any memory
+        final Unsafe unsafe = UNSAFE;
         int headerSize = 1;
         if (inputSize >= 32) {
             headerSize++;
@@ -425,10 +463,10 @@ class ZstdFrameCompressor
 
         switch (headerSize) {
             case 1:
-                UNSAFE.putByte(outputBase, outputAddress, (byte) (RAW_LITERALS_BLOCK | (inputSize << 3)));
+                unsafe.putByte(outputBase, outputAddress, (byte) (RAW_LITERALS_BLOCK | (inputSize << 3)));
                 break;
             case 2:
-                UNSAFE.putShort(outputBase, outputAddress, (short) (RAW_LITERALS_BLOCK | (1 << 2) | (inputSize << 4)));
+                unsafe.putShort(outputBase, outputAddress, (short) (RAW_LITERALS_BLOCK | (1 << 2) | (inputSize << 4)));
                 break;
             case 3:
                 put24BitLittleEndian(outputBase, outputAddress, RAW_LITERALS_BLOCK | (3 << 2) | (inputSize << 4));
